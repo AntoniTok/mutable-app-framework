@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "mutable-app-framework",
+  "main": "src/server.ts",
+  "compatibility_date": "2026-06-11",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Static UI (editor). The worker runs first for these dynamic paths;
+  // everything else is served from ./public.
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/preview/*", "/agents/*"]
+  },
+
+  // Dynamic Worker Loader: lets the host load app code at runtime.
+  "worker_loaders": [{ "binding": "LOADER" }],
+
+  // The AppHost Agent is a Durable Object: one instance = one mutable app.
+  "durable_objects": {
+    "bindings": [{ "name": "AppHost", "class_name": "AppHost" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AppHost"] }],
+
+  // Workers AI: used by the host-side AI author to rewrite app code.
+  "ai": { "binding": "AI" },
+
+  "observability": { "enabled": true }
+}

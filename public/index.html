@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mutable App Framework — lobby</title>
+    <style>
+      :root {
+        --bg: #0d1117; --panel: #161b22; --border: #30363d;
+        --text: #e6edf3; --muted: #8b949e; --accent: #2f81f7; --ok: #3fb950;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: var(--bg); color: var(--text); padding: 24px;
+      }
+      .card {
+        width: 100%; max-width: 460px; background: var(--panel);
+        border: 1px solid var(--border); border-radius: 14px; padding: 28px;
+      }
+      h1 { font-size: 20px; margin: 0 0 4px; }
+      p.sub { margin: 0 0 24px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+      h2 { font-size: 12px; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; letter-spacing: .05em; }
+      .block { padding: 16px 0; border-top: 1px solid var(--border); }
+      .row { display: flex; gap: 8px; align-items: center; }
+      input {
+        flex: 1; background: var(--bg); color: var(--text);
+        border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-family: inherit; font-size: 14px;
+      }
+      button {
+        background: var(--accent); color: #fff; border: none; border-radius: 8px;
+        padding: 10px 16px; font-family: inherit; font-size: 14px; cursor: pointer; white-space: nowrap;
+      }
+      button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+      .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+      .hint a { color: var(--accent); text-decoration: none; }
+      .err { color: #f85149; font-size: 12px; margin: 8px 0 0; min-height: 14px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Mutable App Framework</h1>
+      <p class="sub">
+        Multiplayer rooms. Each room is its own isolated app — its own code,
+        version history and live game state. Create a fresh room or join an
+        existing one by id.
+      </p>
+
+      <div class="block">
+        <h2>Create a room</h2>
+        <div class="row">
+          <button id="create">Create room</button>
+          <span class="hint">Generates a random id and drops you into the game.</span>
+        </div>
+      </div>
+
+      <div class="block">
+        <h2>Join a room</h2>
+        <form class="row" id="joinForm">
+          <input id="roomInput" placeholder="room id (e.g. sunny-fox-42)" spellcheck="false" autocomplete="off" />
+          <button class="ghost" type="submit">Join</button>
+        </form>
+        <p class="err" id="err"></p>
+        <p class="hint">
+          Every room opens on the live game; press <strong>Edit</strong> inside
+          the room to change its code or ask the AI. No id? The default room is
+          <a href="/room?room=main">main</a>.
+        </p>
+      </div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      // Sanitize to the same charset the host accepts for a Durable Object name.
+      function clean(raw) {
+        return (raw || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+      }
+
+      // Friendly random room id: word-word-number.
+      const ADJ = ["sunny", "brave", "quiet", "lucky", "swift", "clever", "calm", "bold", "witty", "keen"];
+      const NOUN = ["fox", "otter", "hawk", "lynx", "crane", "moth", "wolf", "koi", "wren", "yak"];
+      function randomRoom() {
+        const a = ADJ[Math.floor(Math.random() * ADJ.length)];
+        const n = NOUN[Math.floor(Math.random() * NOUN.length)];
+        return a + "-" + n + "-" + Math.floor(Math.random() * 100);
+      }
+
+      // A room page = the live app + (on demand) its editor tools.
+      // (Workers Assets serves room.html at the clean path /room.)
+      function roomUrl(room) {
+        return "/room?room=" + encodeURIComponent(room);
+      }
+
+      $("create").onclick = () => {
+        location.href = roomUrl(randomRoom());
+      };
+
+      $("joinForm").addEventListener("submit", (e) => {
+        e.preventDefault();
+        const room = clean($("roomInput").value);
+        if (!room) { $("err").textContent = "Enter a room id (letters, numbers, - or _)."; return; }
+        $("err").textContent = "";
+        location.href = roomUrl(room);
+      });
+    </script>
+  </body>
+</html>
