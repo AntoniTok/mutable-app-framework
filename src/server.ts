@@ -7,6 +7,7 @@ import type { AppHost } from "./agent/app-host";
 export { AppHost } from "./agent/app-host";
 export { CapabilityBroker } from "./capabilities/broker";
 export { ScopedStore } from "./capabilities/scoped-store";
+export { ScopedFilesystem } from "./capabilities/scoped-filesystem";
 
 // Each room is its own isolated app instance (one Durable Object per id, with
 // its own code + version history + realtime state). The room id is taken from

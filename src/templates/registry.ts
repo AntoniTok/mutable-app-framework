@@ -1,5 +1,6 @@
 import type { AppTemplate } from "./types";
 import { counterTemplate } from "./examples/counter";
+import { notesTemplate } from "./examples/notes";
 import { tictactoeTemplate } from "./examples/tictactoe";
 import { pokerTemplate } from "./examples/poker";
 
@@ -18,7 +19,9 @@ export const templates: Record<string, AppTemplate> = {
   // Multiplayer example app (symmetric state). See src/templates/examples/tictactoe.ts
   tictactoe: tictactoeTemplate,
   // Simpler example app. See src/templates/examples/counter.ts
-  counter: counterTemplate
+  counter: counterTemplate,
+  // Filesystem-backed example app (folders/read/write). See src/templates/examples/notes.ts
+  notes: notesTemplate
   // chat: chatTemplate,   // <- add your own example/app templates here
 };
 

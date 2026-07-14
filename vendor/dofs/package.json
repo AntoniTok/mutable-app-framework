@@ -1,0 +1,15 @@
+{
+  "name": "@cloudflare/dofs",
+  "version": "0.0.0-vendored",
+  "private": true,
+  "type": "module",
+  "description": "Vendored build of @cloudflare/dofs (Durable Object SQLite-backed virtual filesystem). Source: github.com/cloudflare/workspace, packages/dofs. Only the local filesystem layer is used here (Database + initializeSchema + WorkspaceFilesystem); the sync/RPC/git/container machinery is unused.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "main": "./dist/index.js"
+}

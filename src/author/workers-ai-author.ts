@@ -70,12 +70,26 @@ const SYSTEM_PROMPT = `You are a code editor for a sandboxed Cloudflare Worker a
 RULES the code you output MUST follow:
 - Provide a default export with an async fetch handler:
     export default { async fetch(request, env) { ... } }
-- Persist data ONLY via the capability broker at env.SYSTEM:
+- Persist data ONLY via the capability broker at env.SYSTEM. Two options:
+  (a) Key/value store — best for flat values and counters:
     const store = await env.SYSTEM.requestStore("some-namespace");
     await store.put(key, value);   // value is a string
     const value = await store.get(key); // returns string | null
     await store.list();            // returns string[] of keys
     await store.delete(key);
+  (b) Filesystem — best for structured data with folders/paths/search. For SMALL
+      data only (notes, config, history); files cap at 256 KiB (NOT for big blobs):
+    const fs = await env.SYSTEM.requestFilesystem("some-namespace");
+    await fs.writeFile("notes/todo.md", "text"); // string; parents auto-created
+    const text = await fs.readFile("notes/todo.md");  // string | null (null if missing)
+    const list = await fs.readdir("notes");   // [{name,type}] | null
+    const meta = await fs.stat("notes/todo.md"); // {type,size,mtime} | null
+    await fs.mkdir("drafts");
+    await fs.rm("notes/todo.md", { recursive: false });
+    const hits = await fs.grep("milk", "notes"); // [{path,line,text}]
+    const found = await fs.find("", "*.md");     // [{path,type}]
+  Filesystem paths are relative (no leading "/", no ".."). Choose the capability
+  that fits; don't duplicate the same data into both.
 - There is NO network access. Do not call fetch() to external URLs.
 - Plain JavaScript only. No build step, no npm imports.
 
@@ -141,7 +155,8 @@ line that doesn't exist). Fix it with minimal line-edit operations.
 
 The code MUST still follow these rules:
 - Default export with an async fetch handler: export default { async fetch(request, env) { ... } }.
-- Persist ONLY via env.SYSTEM (requestStore(...).get/put/list/delete); values are strings.
+- Persist ONLY via env.SYSTEM: requestStore(...).get/put/list/delete (string values),
+  or requestFilesystem(...).readFile/writeFile/readdir/mkdir/rm/stat/grep/find (paths).
 - No external network access. Plain JavaScript only; no build step, no npm imports.
 - Realtime apps may export pure applyAction(state, action, ctx), initialState, seats, view(state, ctx).
 

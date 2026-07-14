@@ -19,6 +19,12 @@ dist/
 build/
 *.tgz
 
+# Exception: the vendored @cloudflare/dofs package IS its built dist (the
+# upstream package is unpublished/private). It must be committed so the
+# `file:./vendor/dofs` dependency resolves on a fresh clone.
+!vendor/dofs/dist/
+!vendor/dofs/dist/**
+
 # TypeScript
 *.tsbuildinfo
 

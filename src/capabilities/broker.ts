@@ -1,5 +1,6 @@
 import { WorkerEntrypoint, exports } from "cloudflare:workers";
 import type { Env } from "../types";
+import type { ScopedFilesystem, ScopedFilesystemProps } from "./scoped-filesystem";
 import type { ScopedStore, ScopedStoreProps } from "./scoped-store";
 
 /**
@@ -21,6 +22,7 @@ export type CapabilityBrokerProps = {
 // capability stubs to hand back to the app.
 type LoaderExports = {
   ScopedStore(options: { props: ScopedStoreProps }): ScopedStore;
+  ScopedFilesystem(options: { props: ScopedFilesystemProps }): ScopedFilesystem;
 };
 const runtimeExports = exports as unknown as LoaderExports;
 
@@ -41,6 +43,25 @@ export class CapabilityBroker extends WorkerEntrypoint<
       );
     }
     return runtimeExports.ScopedStore({
+      props: { instance: this.ctx.props.instance, namespace }
+    });
+  }
+
+  /**
+   * Grant a private filesystem, backed by @cloudflare/dofs in the app's own
+   * SQLite. Available today.
+   *
+   * For small, structured per-app data (notes, config, game history) — folders,
+   * readdir, stat, grep/find. NOT a blob store: files are capped at 256 KiB.
+   * Large binaries belong in R2 via the reserved `requestBlobStore` hook below.
+   */
+  async requestFilesystem(namespace: string): Promise<ScopedFilesystem> {
+    if (!NAME_RE.test(namespace)) {
+      throw new Error(
+        `Invalid filesystem namespace: "${namespace}". Use letters, digits, "-" or "_".`
+      );
+    }
+    return runtimeExports.ScopedFilesystem({
       props: { instance: this.ctx.props.instance, namespace }
     });
   }

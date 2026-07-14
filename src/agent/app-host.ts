@@ -1,6 +1,13 @@
 import { Agent } from "agents";
 import type { Connection, ConnectionContext, WSMessage } from "agents";
-import type { Env } from "../types";
+import {
+  Database,
+  type DurableObjectStorageLike,
+  initializeSchema,
+  WorkspaceFilesystem,
+  type WorkspaceFsError
+} from "@cloudflare/dofs";
+import type { Env, FsDirent, FsFound, FsGrepMatch, FsStat } from "../types";
 import type { AppFile } from "../templates/types";
 import { getTemplate, DEFAULT_TEMPLATE_ID } from "../templates/registry";
 import { WorkersAiAuthor } from "../author/workers-ai-author";
@@ -48,12 +55,40 @@ const MAX_AI_REPAIRS = 2;
 /** Reserved app_data scope for the realtime engine's own state (see coordinator). */
 const ROOM_SCOPE = "__room__";
 
+/**
+ * Per-file byte cap for the app filesystem capability.
+ *
+ * Deliberately modest (256 KiB): this filesystem is for small, structured
+ * per-app data (notes, config, game history), NOT a blob store. Large binaries
+ * belong in R2 via a future `requestBlobStore` broker hook — not here.
+ */
+const MAX_FS_FILE_BYTES = 256 * 1024;
+
 /** Encode a string to a standalone ArrayBuffer (RPC-serializable body). */
 function encodeUtf8(text: string): ArrayBuffer {
   const bytes = new TextEncoder().encode(text);
   const buf = new ArrayBuffer(bytes.byteLength);
   new Uint8Array(buf).set(bytes);
   return buf;
+}
+
+/** True when a dofs error means "no such file/dir". */
+function isEnoent(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as Partial<WorkspaceFsError>).code === "ENOENT"
+  );
+}
+
+/** Collapse a dofs node's type booleans into a simple tag. */
+function direntType(node: {
+  isDirectory: boolean;
+  isSymbolicLink: boolean;
+}): "file" | "dir" | "symlink" {
+  if (node.isDirectory) return "dir";
+  if (node.isSymbolicLink) return "symlink";
+  return "file";
 }
 
 export class AppHost extends Agent<Env, HostState> {
@@ -358,6 +393,118 @@ export class AppHost extends Agent<Env, HostState> {
   }
   async storeList(scope: string): Promise<string[]> {
     return db.appDataList(this, scope);
+  }
+
+  // ── app filesystem callbacks (invoked by ScopedFilesystem over RPC) ──
+  //
+  // Backed by @cloudflare/dofs: a SQLite-backed virtual filesystem living in
+  // THIS Durable Object's own storage (the vfs_* tables it creates sit beside
+  // our files/versions/app_data tables — no collision). We only use the local
+  // filesystem layer (Database + WorkspaceFilesystem); dofs's sync/RPC/git
+  // machinery is unused.
+  //
+  // Each app namespace gets its own subtree under `/<namespace>`. Callers reach
+  // these only through the broker-minted ScopedFilesystem capability, which has
+  // already sanitised the path (no `..`, no leading slash). We scope again here
+  // by prefixing, so the trusted host is the single place that decides where an
+  // app's bytes can land.
+
+  #fs?: WorkspaceFilesystem;
+
+  /** Lazily build the filesystem and ensure its schema exists (idempotent). */
+  #filesystem(): WorkspaceFilesystem {
+    if (!this.#fs) {
+      // The runtime DurableObjectStorage satisfies dofs's structural
+      // DurableObjectStorageLike; the cast bridges a generic-variance gap in
+      // the SQL cursor's row type (compatible at runtime).
+      const storage = this.ctx.storage as unknown as DurableObjectStorageLike;
+      const database = new Database(storage);
+      // CREATE TABLE IF NOT EXISTS for the vfs_* tables. Safe to run every time.
+      initializeSchema(database, Date.now);
+      this.#fs = new WorkspaceFilesystem(database);
+    }
+    return this.#fs;
+  }
+
+  /** Absolute VFS path for an app's namespace-relative path. */
+  #fsPath(namespace: string, path: string): string {
+    const rel = path.replace(/^\/+/, "");
+    return rel ? `/${namespace}/${rel}` : `/${namespace}`;
+  }
+
+  /** Strip the `/<namespace>` prefix off a VFS path on the way back to the app. */
+  #fsUnscope(namespace: string, absolutePath: string): string {
+    const root = `/${namespace}`;
+    if (absolutePath === root) return "/";
+    return absolutePath.startsWith(`${root}/`) ? absolutePath.slice(root.length) : absolutePath;
+  }
+
+  async fsReadFile(namespace: string, path: string): Promise<string | null> {
+    try {
+      return await this.#filesystem().readFile(this.#fsPath(namespace, path), "utf8");
+    } catch (err) {
+      if (isEnoent(err)) return null; // missing file -> null (like store.get)
+      throw err;
+    }
+  }
+
+  async fsWriteFile(namespace: string, path: string, content: string): Promise<void> {
+    const bytes = new TextEncoder().encode(content).byteLength;
+    if (bytes > MAX_FS_FILE_BYTES) {
+      throw new Error(
+        `File too large (${bytes} bytes, max ${MAX_FS_FILE_BYTES}). ` +
+          "This filesystem is for small structured data, not large blobs."
+      );
+    }
+    const fs = this.#filesystem();
+    const absolute = this.#fsPath(namespace, path);
+    // dofs never auto-creates parents; create the directory chain first.
+    const parent = absolute.slice(0, absolute.lastIndexOf("/")) || "/";
+    if (parent !== "/") await fs.mkdir(parent, { recursive: true });
+    await fs.writeFile(absolute, content);
+  }
+
+  async fsReaddir(namespace: string, path: string): Promise<FsDirent[] | null> {
+    try {
+      const entries = await this.#filesystem().readdir(this.#fsPath(namespace, path));
+      return entries.map((e) => ({ name: e.name, type: direntType(e) }));
+    } catch (err) {
+      if (isEnoent(err)) return null;
+      throw err;
+    }
+  }
+
+  async fsMkdir(namespace: string, path: string): Promise<void> {
+    await this.#filesystem().mkdir(this.#fsPath(namespace, path), { recursive: true });
+  }
+
+  async fsRm(namespace: string, path: string, recursive: boolean): Promise<void> {
+    // force:true so removing a missing path is a no-op (like store.delete).
+    await this.#filesystem().rm(this.#fsPath(namespace, path), { recursive, force: true });
+  }
+
+  async fsStat(namespace: string, path: string): Promise<FsStat | null> {
+    try {
+      const s = await this.#filesystem().stat(this.#fsPath(namespace, path));
+      return { type: direntType(s), size: s.size, mtime: s.mtime };
+    } catch (err) {
+      if (isEnoent(err)) return null;
+      throw err;
+    }
+  }
+
+  async fsGrep(namespace: string, pattern: string, path: string): Promise<FsGrepMatch[]> {
+    const matches = await this.#filesystem().grep(pattern, this.#fsPath(namespace, path));
+    return matches.map((m) => ({
+      path: this.#fsUnscope(namespace, m.path),
+      line: m.line,
+      text: m.text
+    }));
+  }
+
+  async fsFind(namespace: string, dir: string, pattern?: string): Promise<FsFound[]> {
+    const found = await this.#filesystem().find(this.#fsPath(namespace, dir), pattern);
+    return found.map((f) => ({ path: this.#fsUnscope(namespace, f.path), type: f.type }));
   }
 
   // ── internals ──

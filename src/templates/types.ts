@@ -10,8 +10,28 @@
  *   - Provide a default export with a `fetch(request, env)` handler,
  *     e.g. `export default { fetch(request, env) { ... } }`.
  *   - Persist data ONLY through the capability broker handed in as `env.SYSTEM`.
- *     Example: `const store = await env.SYSTEM.requestStore("main");`
- *              `await store.put("count", "1");`
+ *     Two storage capabilities exist today:
+ *
+ *       // Flat key/value store — strings in, strings out.
+ *       const store = await env.SYSTEM.requestStore("main");
+ *       await store.put("count", "1");
+ *       const n = await store.get("count");   // string | null
+ *
+ *       // Filesystem — folders, listing, search. For SMALL structured data
+ *       // (notes, config, history), NOT large blobs (files cap at 256 KiB).
+ *       const fs = await env.SYSTEM.requestFilesystem("main");
+ *       await fs.writeFile("notes/todo.md", "buy milk");  // creates parents
+ *       const text = await fs.readFile("notes/todo.md");  // string | null
+ *       const entries = await fs.readdir("notes");        // [{name,type}] | null
+ *       const meta = await fs.stat("notes/todo.md");      // {type,size,mtime} | null
+ *       await fs.mkdir("drafts");
+ *       await fs.rm("notes/todo.md");                     // {recursive?:boolean}
+ *       const hits = await fs.grep("milk", "notes");      // [{path,line,text}]
+ *       const found = await fs.find("", "*.md");          // [{path,type}]
+ *
+ *     Filesystem paths are namespace-relative (no leading "/", no ".."); missing
+ *     files/dirs read back as `null`. Pick ONE capability that fits the data —
+ *     don't mirror the same data into both.
  *   - There is NO direct network access (egress is blocked). Reach the outside
  *     world only through capabilities the broker grants.
  *
@@ -79,7 +99,7 @@ export interface AppTemplate {
   files: AppFile[];
   /**
    * Capabilities this app expects the broker to grant.
-   * Today only "store" exists. Future: "blob", "kv", "room".
+   * Today "store" (key/value) and "fs" (filesystem) exist. Future: "blob", "room".
    */
   declares: string[];
   /** Entry file. Defaults to "src/index.js" if omitted. */
