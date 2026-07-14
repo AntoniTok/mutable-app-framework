@@ -106,12 +106,15 @@ rollback), so what you see always matches the live version.
 ```
 src/
   server.ts                    Entry Worker. Routes /api/*, /preview/*, /agents/*.
-  types.ts                     Env bindings + AppDataStore RPC interface.
+  types.ts                     Env bindings + AppDataStore / AppFsStore RPC interfaces.
 
   agent/
     app-host.ts                THE AGENT (Durable Object): stores/versions code,
-                               runs it, editWithAI / setFiles / rollback / reset.
+                               runs it, editWithAI / setFiles / rollback / reset;
+                               also hosts the dofs filesystem (fs* RPC methods).
     schema.ts                  SQLite tables (files, versions, app_data) + helpers.
+                               The app's private filesystem adds its own dofs
+                               vfs_* tables to the same SQLite.
     runner.ts                  Bundles live code + runs it in a Dynamic Worker
                                (SYSTEM only, no egress, content-hash cached).
                                runApp() serves fetch; reduce()/initialState()
@@ -119,9 +122,12 @@ src/
                                adapter entrypoint (both share one bundle).
 
   capabilities/
-    broker.ts                  The gatekeeper (env.SYSTEM). requestStore() active;
-                               requestBlobStore / requestRoom reserved.
+    broker.ts                  The gatekeeper (env.SYSTEM). requestStore() +
+                               requestFilesystem() active; requestBlobStore /
+                               requestRoom reserved.
     scoped-store.ts            Per-app key/value store backed by app_data.
+    scoped-filesystem.ts       Per-app filesystem (namespace-scoped, path-sanitised)
+                               backed by @cloudflare/dofs over the room's SQLite.
 
   author/
     types.ts                   CodeAuthor interface (the swappable-AI seam).
@@ -135,7 +141,9 @@ src/
       poker.ts                 EXAMPLE APP (default seed): realtime multiplayer
                                with HIDDEN INFORMATION (per-player views).
       tictactoe.ts             EXAMPLE APP: realtime multiplayer (symmetric).
-      counter.ts               EXAMPLE APP: simple interactive counter.
+      counter.ts               EXAMPLE APP: simple interactive counter (store).
+      notes.ts                 EXAMPLE APP: notes pad backed by the filesystem
+                               capability (folders / read / write / list).
 
   realtime/
     coordinator.ts             The realtime engine: WS connections, presence,
@@ -151,6 +159,11 @@ public/
 
 wrangler.jsonc                 Bindings: AppHost DO, LOADER, AI, static assets.
 worker-configuration.d.ts      Generated binding/runtime types (npm run types).
+
+vendor/
+  dofs/                        Vendored @cloudflare/dofs (unpublished): its built
+                               dist is committed and referenced via a file:
+                               dependency. Powers the filesystem capability.
 ```
 
 ---
@@ -197,7 +210,11 @@ Everything lives in the AppHost's own SQLite (per instance, per app):
 - `files(version, path, content)` — the source code, one row per file per version.
 - `versions(id, ts, note)` — the history list (enables rollback).
 - `app_data(scope, k, v)` — the running app's own key/value data (reached via the
-  broker), separate from its code.
+  broker `requestStore`), separate from its code.
+- `vfs_*` — the app's private **filesystem** (reached via the broker
+  `requestFilesystem`), managed by `@cloudflare/dofs`. It's a real POSIX-ish
+  filesystem (folders, `stat`, `grep`, `find`) stored as rows in this same
+  SQLite — for small structured data (files capped at 256 KiB), not large blobs.
 
 Small, synced state (`this.setState`) holds only a pointer:
 `{ activeVersion, status, templateId, lastError }`. Code is kept in SQL (never
@@ -216,7 +233,10 @@ Defined in `src/templates/types.ts`. An app's files must:
 - Provide a default export with `async fetch(request, env)`.
 - Serve a real HTML page at `/` (content-type `text/html`) with the UI, and put
   actions behind data endpoints that return JSON.
-- Persist ONLY via `env.SYSTEM`:
+- Persist ONLY via `env.SYSTEM`. Two storage capabilities are available today —
+  pick the one that fits the data; don't mirror the same data into both.
+
+  A flat **key/value store** (`requestStore`) — best for counters and flat values:
   ```js
   const store = await env.SYSTEM.requestStore("my-namespace");
   await store.put(key, value);        // value is a string
@@ -224,13 +244,29 @@ Defined in `src/templates/types.ts`. An app's files must:
   await store.list();                 // string[]
   await store.delete(key);
   ```
+
+  A private **filesystem** (`requestFilesystem`) — best for structured data with
+  folders/paths/search. For SMALL data only (files capped at 256 KiB), not blobs:
+  ```js
+  const fs = await env.SYSTEM.requestFilesystem("my-namespace");
+  await fs.writeFile("notes/todo.md", "text");  // parents auto-created
+  const text = await fs.readFile("notes/todo.md");  // string | null (null if missing)
+  const list = await fs.readdir("notes");       // [{ name, type }] | null
+  const meta = await fs.stat("notes/todo.md");  // { type, size, mtime } | null
+  await fs.mkdir("drafts");
+  await fs.rm("notes/todo.md", { recursive: false });
+  const hits = await fs.grep("milk", "notes");  // [{ path, line, text }]
+  const found = await fs.find("", "*.md");      // [{ path, type }]
+  ```
+  Paths are namespace-relative (no leading `/`, no `..`); missing files read as
+  `null`. Path sanitisation lives in the trusted `ScopedFilesystem`, not the app.
 - Make **no** external network calls (egress is blocked).
 - Use **relative** URLs in HTML (`fetch("inc")`, not `/inc`) — the app is
   previewed under `/preview/`.
 
 `AppTemplate.declares` lists the capabilities an app expects (e.g. `"store"`,
-`"room"`). Multiplayer apps additionally export a pure `applyAction` reducer (+
-optional `initialState`) — see [Multiplayer](#multiplayer-live-pure-reducer).
+`"fs"`, `"room"`). Multiplayer apps additionally export a pure `applyAction`
+reducer (+ optional `initialState`) — see [Multiplayer](#multiplayer-live-pure-reducer).
 
 ---
 
@@ -247,9 +283,11 @@ optional `initialState`) — see [Multiplayer](#multiplayer-live-pure-reducer).
    seeds from it. (A room already in `.wrangler/` keeps its seeded code — use a
    fresh room id, or clear `.wrangler/`, after switching.)
 
-All three bundled example apps (`poker`, `tictactoe`, `counter`) conform to the
-current contract and can be hosted this way; `npm run smoke` checks whichever one
-is live (set `DEFAULT_TEMPLATE_ID`, restart `npm run dev`, re-run to cover all).
+All four bundled example apps (`poker`, `tictactoe`, `counter`, `notes`) conform
+to the current contract and can be hosted this way; `npm run smoke` checks the
+live one for `counter`/`tictactoe`/`poker` (set `DEFAULT_TEMPLATE_ID`, restart
+`npm run dev`, re-run to cover them). `notes` (the filesystem demo) has no smoke
+check yet — test it by hand in the browser.
 
 ### Swap the AI model
 
@@ -271,13 +309,19 @@ Override per-instance with a `.dev.vars` line `AUTHOR_MODEL="..."` locally, or
 
 The **broker is the growth point**. Adding a resource type is additive:
 
-1. Bind the resource to the host in `wrangler.jsonc`.
+1. Bind the resource to the host in `wrangler.jsonc` (if it needs a binding).
 2. Add one `request*` method to `CapabilityBroker` (see reserved
    `requestBlobStore` / `requestRoom` hooks) that returns a scoped capability
    stub, prefixed by `props.instance` for isolation.
 
 The app contract and runner don't change — apps just call
 `env.SYSTEM.requestBlobStore(...)`.
+
+The **filesystem capability** (`requestFilesystem` → `ScopedFilesystem`) is a
+real, shipped instance of exactly this pattern: it mirrors the
+`requestStore` → `ScopedStore` chain, adds path sanitisation + a namespace
+prefix in the trusted `ScopedFilesystem`, and delegates to `@cloudflare/dofs`
+running over the AppHost's own SQLite — so it needed no new binding at all.
 
 ### Multiplayer (live: pure-reducer)
 
