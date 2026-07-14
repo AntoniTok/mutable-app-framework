@@ -196,6 +196,29 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 // be tens of seconds even though it then streams steadily.
 const IDLE_TIMEOUT_MS = 45_000;
 
+// Transient-failure retry for the model call. A network blip or 5xx when kicking
+// off the request is worth one automatic retry; a genuine timeout/stall/empty
+// result is NOT (it already spent the time budget — see isTransientAiError), so
+// we cap attempts low to bound worst-case wall-clock (each attempt gets a fresh
+// full timeout). Single caller => no jitter needed.
+const MAX_GENERATE_ATTEMPTS = 2; // one retry
+const RETRY_BASE_DELAY_MS = 500;
+
+/**
+ * Whether a generation error is a transient failure worth retrying. The author's
+ * OWN budget-exhausting errors (timeout, idle stall, empty response) are not
+ * retried — they aren't transient and re-running would just burn more time.
+ * Everything else (e.g. the AI binding rejecting before the stream starts) is
+ * treated as transient.
+ */
+function isTransientAiError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/AI generation exceeded/i.test(msg)) return false; // overall timeout
+  if (/AI generation stalled/i.test(msg)) return false; // per-chunk idle timeout
+  if (/empty response/i.test(msg)) return false; // model returned nothing
+  return true;
+}
+
 interface AiRunInput {
   messages: { role: string; content: string }[];
   max_tokens?: number;
@@ -277,8 +300,29 @@ export class WorkersAiAuthor implements CodeAuthor {
     return parseFiles(raw);
   }
 
-  /** Run one chat completion (streamed) and return the raw accumulated text. */
+  /**
+   * Run a chat completion, retrying once on a TRANSIENT failure (e.g. the AI
+   * binding rejecting before the stream starts). Timeouts/stalls/empty results
+   * are not retried (see isTransientAiError). Each attempt is a full, isolated
+   * run+drain that either returns complete text or throws before anything is
+   * committed to state, so retrying at this boundary is safe.
+   */
   async #generate(system: string, user: string): Promise<string> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= MAX_GENERATE_ATTEMPTS; attempt++) {
+      try {
+        return await this.#generateOnce(system, user);
+      } catch (err) {
+        lastErr = err;
+        if (attempt === MAX_GENERATE_ATTEMPTS || !isTransientAiError(err)) throw err;
+        await new Promise((r) => setTimeout(r, RETRY_BASE_DELAY_MS * attempt));
+      }
+    }
+    throw lastErr;
+  }
+
+  /** Run one chat completion (streamed) and return the raw accumulated text. */
+  async #generateOnce(system: string, user: string): Promise<string> {
     const result = await this.#ai.run(this.#model, {
       messages: [
         { role: "system", content: system },

@@ -249,56 +249,63 @@ export class AppHost extends Agent<Env, HostState> {
   async editWithAI(instruction: string): Promise<number> {
     this.setState({ ...this.state, status: "building", lastError: null });
     try {
-      const template = getTemplate(this.state.templateId);
-      const author = this.#getAuthor();
-      const base = this.currentFilesSync();
+      // Hold an alarm-backed heartbeat for the whole generation. AI edits stream
+      // a model response and may run several seconds (plus self-heal retries and
+      // build validations); without this the Durable Object can be idle-evicted
+      // mid-flight (see the Agents SDK's keepAlive docs — AIChatAgent does the
+      // same around its streams). keepAliveWhile auto-disposes on success/throw.
+      return await this.keepAliveWhile(async () => {
+        const template = getTemplate(this.state.templateId);
+        const author = this.#getAuthor();
+        const base = this.currentFilesSync();
 
-      // Self-heal loop. Two kinds of failure are fed back to the author and
-      // retried (up to MAX_AI_REPAIRS times), because both are usually a small
-      // model slip:
-      //   - APPLY failure — a line op referenced a nonexistent line. We
-      //     re-attempt against the ORIGINAL files with the mismatch as feedback.
-      //   - BUILD failure — the applied code doesn't compile. We ask the author
-      //     to fix the BROKEN files with the exact build error as feedback.
-      // We only save (setFiles) the final result, so retries don't spam versions.
-      let candidate: AppFile[] | null = null;
-      let repairBase = base;
-      let feedback: string | null = null;
+        // Self-heal loop. Two kinds of failure are fed back to the author and
+        // retried (up to MAX_AI_REPAIRS times), because both are usually a small
+        // model slip:
+        //   - APPLY failure — a line op referenced a nonexistent line. We
+        //     re-attempt against the ORIGINAL files with the mismatch as feedback.
+        //   - BUILD failure — the applied code doesn't compile. We ask the author
+        //     to fix the BROKEN files with the exact build error as feedback.
+        // We only save (setFiles) the final result, so retries don't spam versions.
+        let candidate: AppFile[] | null = null;
+        let repairBase = base;
+        let feedback: string | null = null;
 
-      for (let attempt = 0; attempt <= MAX_AI_REPAIRS; attempt++) {
-        let produced: AppFile[];
-        try {
-          produced =
-            feedback === null
-              ? await author.edit({ instruction, files: base, declares: template.declares })
-              : await author.repair({
-                  instruction,
-                  files: repairBase,
-                  error: feedback,
-                  declares: template.declares
-                });
-        } catch (genErr) {
-          // Generation/apply failure: retry against the original files.
-          feedback = genErr instanceof Error ? genErr.message : String(genErr);
-          repairBase = base;
-          if (attempt === MAX_AI_REPAIRS) throw genErr;
-          continue;
+        for (let attempt = 0; attempt <= MAX_AI_REPAIRS; attempt++) {
+          let produced: AppFile[];
+          try {
+            produced =
+              feedback === null
+                ? await author.edit({ instruction, files: base, declares: template.declares })
+                : await author.repair({
+                    instruction,
+                    files: repairBase,
+                    error: feedback,
+                    declares: template.declares
+                  });
+          } catch (genErr) {
+            // Generation/apply failure: retry against the original files.
+            feedback = genErr instanceof Error ? genErr.message : String(genErr);
+            repairBase = base;
+            if (attempt === MAX_AI_REPAIRS) throw genErr;
+            continue;
+          }
+
+          candidate = produced;
+          const buildErr = await this.#buildError(produced);
+          if (!buildErr) return await this.setFiles(produced, `ai: ${instruction}`);
+
+          // Built but broken: fix the broken files next time.
+          feedback = buildErr;
+          repairBase = produced;
+          if (attempt === MAX_AI_REPAIRS) break;
         }
 
-        candidate = produced;
-        const buildErr = await this.#buildError(produced);
-        if (!buildErr) return await this.setFiles(produced, `ai: ${instruction}`);
-
-        // Built but broken: fix the broken files next time.
-        feedback = buildErr;
-        repairBase = produced;
-        if (attempt === MAX_AI_REPAIRS) break;
-      }
-
-      // Out of retries: save the last candidate (broken) so it can be inspected;
-      // setFiles keeps the live pointer on the last good version and flags error.
-      if (!candidate) throw new Error("AI produced no usable output.");
-      return await this.setFiles(candidate, `ai: ${instruction}`);
+        // Out of retries: save the last candidate (broken) so it can be inspected;
+        // setFiles keeps the live pointer on the last good version and flags error.
+        if (!candidate) throw new Error("AI produced no usable output.");
+        return await this.setFiles(candidate, `ai: ${instruction}`);
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // Keep the previous version intact; just record the failure.

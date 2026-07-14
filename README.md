@@ -18,12 +18,12 @@ the app — by hand or by asking an AI — and the next request runs the new cod
 ```
                     ┌──────────────── STABLE CORE (the framework) ───────────────┐
 Browser ─── HTTP ──▶│  server.ts → AppHost (Durable Object, one per room)        │
- lobby + room UI    │    • stores app source + version history in its own SQLite   │
-                    │    • runs the live version in a sandbox (runner.ts)          │
-                    │    • rewrites the app via an AI author (host-side)           │
-                    │  contracts:  CodeAuthor        AppTemplate + fetch()          │
-                    └──────▲───────────────────────────────────▲──────────────────┘
-                           │ implements                         │ conforms to
+ lobby + room UI    │    • stores app source + version history in its own SQLite │
+                    │    • runs the live version in a sandbox (runner.ts)        │
+                    │    • rewrites the app via an AI author (host-side)         │
+                    │  contracts:  CodeAuthor        AppTemplate + fetch()       │
+                    └──────▲───────────────────────────────────▲─────────────────┘
+                           │ implements                        │ conforms to
                      AI author (swappable)              app templates (swappable,
                      Workers AI / OpenAI / …            include their own UI)
 ```
