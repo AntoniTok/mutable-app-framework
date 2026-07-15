@@ -39,5 +39,8 @@
     "ASSISTANT_MODEL": "@cf/zai-org/glm-5.2"
   },
 
-  "observability": { "enabled": true }
+  // Workers Logs. `head_sampling_rate: 1` captures every invocation so the
+  // DynamicWorkerTail (which re-emits each untrusted app run's logs/exceptions
+  // from the host worker) is never sampled out. See src/observability/.
+  "observability": { "enabled": true, "head_sampling_rate": 1 }
 }

@@ -1,7 +1,7 @@
 # Mutable App Framework
 
 A **self-modifying application framework** built on Cloudflare's Agents SDK,
-Durable Objects, and Dynamic Workers.
+Durable Objects, Dynamic Workers, and Durable Object Facets.
 
 An "app" is not deployed as code — it lives as **data** inside a Durable Object.
 Requests run the app's *current* source in an isolated Dynamic Worker. You change
@@ -18,9 +18,10 @@ the app — by hand or by asking an AI — and the next request runs the new cod
 ```
                     ┌──────────────── STABLE CORE (the framework) ───────────────┐
 Browser ─── HTTP ──▶│  server.ts → AppHost (Durable Object, one per room)        │
- lobby + room UI    │    • stores app source + version history in its own SQLite │
+ lobby + room UI    │    • stores app CODE + version history in its own SQLite   │
                     │    • runs the live version in a sandbox (runner.ts)        │
-                     │    • edits the app via an AI assistant (host-side)        │
+                    │    • app runtime data lives in a FACET (isolated SQLite)   │
+                    │    • edits the app via an AI assistant (host-side)         │
                     │  contracts:  AppHost RPC        AppTemplate + fetch()      │
                     └──────▲───────────────────────────────────▲─────────────────┘
                            │ tool-calls (RPC)                  │ conforms to
@@ -101,9 +102,13 @@ change promotes a new live version, **every connected client auto-reloads** too
 | --- | --- |
 | `npm run dev` | Local dev server (`wrangler dev`) |
 | `npm run deploy` | Deploy to Cloudflare (`wrangler deploy`) |
+| `npm run build:facet` | Bundle the storage facet (+ tree-shaken dofs) into `bundle.generated.ts` |
 | `npm run types` | Regenerate `worker-configuration.d.ts` from `wrangler.jsonc` |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run smoke` | Runtime checks for the live app (dev server must be running) |
+
+`build:facet` runs automatically before `dev`, `start`, `deploy`, and `typecheck`
+(npm `pre*` hooks), so the generated facet source is always current.
 
 ---
 
@@ -115,25 +120,38 @@ src/
   types.ts                     Env bindings + AppDataStore / AppFsStore RPC interfaces.
 
   agent/
-    app-host.ts                THE AGENT (Durable Object): stores/versions code,
-                               runs it, setFiles / rollback / reset / preview;
-                               also hosts the dofs filesystem (fs* RPC methods).
-    schema.ts                  SQLite tables (files, versions, app_data) + helpers.
-                               The app's private filesystem adds its own dofs
-                               vfs_* tables to the same SQLite.
+    app-host.ts                THE AGENT (Durable Object): stores/versions CODE,
+                               runs it, setFiles / rollback / reset / preview.
+                               store*/fs* RPC methods forward to the facet.
+    schema.ts                  AppHost SQLite tables (files, versions; app_data
+                               now holds ONLY the realtime __room__ scope) + helpers.
     runner.ts                  Bundles live code + runs it in a Dynamic Worker
-                               (SYSTEM only, no egress, content-hash cached).
-                               runApp() serves fetch; reduce()/initialState()
-                               call the app's pure reducer via an injected
-                               adapter entrypoint (both share one bundle).
+                               (SYSTEM only, no egress, content-hash cached,
+                               DynamicWorkerTail attached). runApp() serves fetch;
+                               reduce()/initialState() call the app's pure reducer
+                               via an injected adapter entrypoint (one bundle).
+    facet/
+      entry.ts                 AppStorageFacet: the app's runtime data (key/value
+                               store + dofs filesystem) in its OWN isolated SQLite,
+                               run as a facet beneath AppHost.
+      bundle.generated.ts      AUTO-GENERATED bundled facet source (npm run
+                               build:facet); handed to the Worker Loader.
+    app-storage-facet.ts       Facet surface: re-exports the bundled source, the
+                               loader id / facet name, and the RPC stub type.
+
+  observability/
+    dynamic-worker-tail.ts     DynamicWorkerTail: captures each untrusted app
+                               run's logs/exceptions/outcome into Workers Logs,
+                               tagged by workerId.
 
   capabilities/
     broker.ts                  The gatekeeper (env.SYSTEM). requestStore() +
                                requestFilesystem() active; requestBlobStore /
                                requestRoom reserved.
-    scoped-store.ts            Per-app key/value store backed by app_data.
-    scoped-filesystem.ts       Per-app filesystem (namespace-scoped, path-sanitised)
-                               backed by @cloudflare/dofs over the room's SQLite.
+    scoped-store.ts            Per-app key/value store (mediated here; backed by
+                               the facet via AppHost).
+    scoped-filesystem.ts       Per-app filesystem (namespace-scoped, path-sanitised;
+                               dofs runs in the facet, reached via AppHost).
 
   assistant/
     code-assistant.ts          THE AI CODING ASSISTANT: a separate Durable Object
@@ -173,13 +191,20 @@ public/
                                at /room.html?room=<id>.
 
 wrangler.jsonc                 Bindings: AppHost + CodeAssistant DOs, LOADER, AI,
-                               static assets, ASSISTANT_MODEL var.
+                               static assets, ASSISTANT_MODEL var, observability
+                               (head_sampling_rate: 1 for the tail worker).
 worker-configuration.d.ts      Generated binding/runtime types (npm run types).
+
+scripts/
+  build-facet.mjs              esbuild step: bundles the facet (+ tree-shaken
+                               dofs) into src/agent/facet/bundle.generated.ts.
+  smoke.mjs                    Dependency-free runtime smoke test for the live app.
 
 vendor/
   dofs/                        Vendored @cloudflare/dofs (unpublished): its built
                                dist is committed and referenced via a file:
-                               dependency. Powers the filesystem capability.
+                               dependency. Bundled into the facet (tree-shaken) to
+                               power the filesystem capability.
 ```
 
 ---
@@ -190,11 +215,12 @@ vendor/
 ```
 Browser → server.ts (/preview/*) → AppHost.preview()
         → runner.runApp(): bundle live files → LOADER.get(hash) (isolated worker)
-            env = { SYSTEM: broker },  globalOutbound = null
+            env = { SYSTEM: broker },  globalOutbound = null,  tails = [tail]
         → app.fetch() runs; may call env.SYSTEM.requestStore() → ScopedStore
-            → back into AppHost's app_data table (per-app, per-namespace)
+            → AppHost forwards into the app-data FACET (its own isolated SQLite)
         → response returned; HTML gets <base href="/preview/"> injected so the
           app's relative links/buttons work inside the preview.
+        → after the run, DynamicWorkerTail ships the app's logs to Workers Logs.
 ```
 
 **Change the app (AI — the assistant)**
@@ -222,18 +248,31 @@ a new version, no model involved.
 
 ---
 
-## Storage model (two tiers)
+## Storage model (code vs. runtime data)
 
-Everything lives in the AppHost's own SQLite (per instance, per app):
+Code and app runtime data have opposite lifecycles — a versioned artifact vs.
+live mutable state — so they live in **separate** SQLite databases.
+
+**AppHost's own SQLite** holds the CODE (the source of truth):
 
 - `files(version, path, content)` — the source code, one row per file per version.
 - `versions(id, ts, note)` — the history list (enables rollback).
-- `app_data(scope, k, v)` — the running app's own key/value data (reached via the
-  broker `requestStore`), separate from its code.
-- `vfs_*` — the app's private **filesystem** (reached via the broker
-  `requestFilesystem`), managed by `@cloudflare/dofs`. It's a real POSIX-ish
-  filesystem (folders, `stat`, `grep`, `find`) stored as rows in this same
-  SQLite — for small structured data (files capped at 256 KiB), not large blobs.
+- `app_data(scope, k, v)` — now ONLY the realtime engine's `__room__` state (the
+  coordinator's own state, not app data).
+
+**The facet's isolated SQLite** (`AppStorageFacet`, a child DO) holds the app's
+RUNTIME DATA, reached via the broker and forwarded by AppHost:
+
+- `app_data(scope, k, v)` — the app's key/value store (broker `requestStore`).
+- `vfs_*` — the app's private **filesystem** (broker `requestFilesystem`), managed
+  by `@cloudflare/dofs` (bundled into the facet). A real POSIX-ish filesystem
+  (folders, `stat`, `grep`, `find`) for small structured data (files capped at
+  256 KiB), not large blobs.
+
+The facet has its own database (AppHost can't read it) and its own input gate, so
+a chatty app can't bloat version history or contend with the realtime coordinator.
+The untrusted app still never touches the facet directly — the broker's scoped
+stubs validate/quota/sanitise, and AppHost forwards the call in.
 
 Small, synced state (`this.setState`) holds only a pointer:
 `{ activeVersion, status, templateId, lastError }`. Code is kept in SQL (never
@@ -343,8 +382,9 @@ The app contract and runner don't change — apps just call
 The **filesystem capability** (`requestFilesystem` → `ScopedFilesystem`) is a
 real, shipped instance of exactly this pattern: it mirrors the
 `requestStore` → `ScopedStore` chain, adds path sanitisation + a namespace
-prefix in the trusted `ScopedFilesystem`, and delegates to `@cloudflare/dofs`
-running over the AppHost's own SQLite — so it needed no new binding at all.
+prefix in the trusted `ScopedFilesystem`, and delegates (via AppHost) to
+`@cloudflare/dofs` running inside the app-data **facet**'s isolated SQLite — so it
+needed no new binding at all.
 
 ### Multiplayer (live: pure-reducer)
 
@@ -493,10 +533,22 @@ version history and realtime state). The default room is `main`.
 - **The AI assistant is `@cloudflare/think` (EXPERIMENTAL).** It runs as a
   separate per-room Durable Object (`CodeAssistant`) and drives an agentic loop
   over host-side tools. It's a heavy dependency (`ai` v6 — NOT v7 — `zod` v4,
-  `@cloudflare/shell`, codemode, just-bash; ~5 MB gzip bundle). We install the
-  minimal set: no React / `@cloudflare/ai-chat` (the Chat panel is vanilla JS),
-  and Think's workspace/bash/code-execution tools are gated off. `Think`'s peer
-  `agents >=0.17.1` is satisfied by the pinned `0.17.3`.
+  `@cloudflare/shell`, codemode, just-bash; ~5 MB gzip bundle — this dominates the
+  host worker). We install the minimal set: no React / `@cloudflare/ai-chat` (the
+  Chat panel is vanilla JS), and Think's workspace/bash/code-execution tools are
+  gated off. `Think`'s peer `agents >=0.17.1` is satisfied by the pinned `0.17.3`.
+- **App runtime data lives in a facet.** The key/value store and the dofs
+  filesystem run in `AppStorageFacet` (its own isolated SQLite), not AppHost; the
+  broker still mediates every call. dofs is bundled into the facet (tree-shaken),
+  so it no longer executes in the host isolate — though the ~28 KiB facet source
+  still ships embedded as a string (to hand to the Worker Loader), making the
+  host-bundle trim modest. Rooms created before this change won't see their old
+  pre-facet `app_data` KV — use a fresh room id (or clear `.wrangler/`).
+- **Dynamic Worker logs need the tail worker.** A Dynamic Worker runs in its own
+  context, so its `console.log()`/exceptions aren't captured automatically.
+  `DynamicWorkerTail` (attached in `runner.ts`) forwards them into Workers Logs
+  tagged by `workerId`; it relies on `observability.head_sampling_rate: 1` in
+  `wrangler.jsonc`.
 - **Tool-driven, line-addressed edits.** `apply_line_edits` (the fast path)
   passes structured ops to `applyEdits` (applied bottom-up so line numbers stay
   valid; validates bounds/overlap). `read_file` shows 1-indexed line numbers so

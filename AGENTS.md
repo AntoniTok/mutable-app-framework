@@ -12,10 +12,24 @@ Object; each request runs the live version in an isolated Dynamic Worker; edits
 ## Where things are
 
 - `src/server.ts` — entry Worker; routes `/api/*`, `/preview/*`, `/agents/*`.
-- `src/agent/app-host.ts` — the Agent (DO). Source of truth + all actions.
-- `src/agent/runner.ts` — runs untrusted app code in a Dynamic Worker.
-- `src/agent/schema.ts` — SQLite tables + query helpers.
-- `src/capabilities/{broker,scoped-store}.ts` — capability sandbox.
+  Exports the DOs + capability entrypoints + `DynamicWorkerTail`.
+- `src/agent/app-host.ts` — the Agent (DO). Source of truth for CODE + all
+  actions. Forwards the app's runtime data (store + fs) to the facet.
+- `src/agent/runner.ts` — runs untrusted app code in a Dynamic Worker (injects
+  the `SYSTEM` broker, `globalOutbound: null`, and attaches the tail worker).
+- `src/agent/schema.ts` — AppHost's SQLite tables + query helpers (`files`,
+  `versions`; `app_data` now holds ONLY the realtime `__room__` scope).
+- `src/agent/facet/entry.ts` — the `AppStorageFacet` Durable Object: an app's
+  runtime data (key/value store + dofs filesystem) in its OWN isolated SQLite,
+  run as a facet beneath AppHost. Bundled (with tree-shaken dofs) to a string by
+  `scripts/build-facet.mjs` → `src/agent/facet/bundle.generated.ts`.
+- `src/agent/app-storage-facet.ts` — the facet surface: re-exports the bundled
+  source, the loader id / facet name, and the RPC stub type.
+- `src/observability/dynamic-worker-tail.ts` — `DynamicWorkerTail`: captures each
+  untrusted app run's logs/exceptions/outcome into Workers Logs, tagged by
+  `workerId` (attached in `runner.ts`).
+- `src/capabilities/{broker,scoped-store,scoped-filesystem}.ts` — capability
+  sandbox.
 - `src/assistant/code-assistant.ts` — the AI coding assistant, a SEPARATE Durable
   Object `CodeAssistant extends Think` (`@cloudflare/think`). One per room, keyed
   by the room id. Runs the agentic loop (model calls host-side tools → reads
@@ -107,6 +121,19 @@ per room (app + assistant), same id.
    (symmetric apps like tic-tac-toe, unchanged). NEVER put secrets only in the
    reducer's broadcast path — redact them in `view`.
 
+10. **App runtime data lives in a FACET, still behind the broker.** An app's own
+    store (`requestStore`) and filesystem (`requestFilesystem`) are backed by the
+    `AppStorageFacet` — a child DO with its OWN isolated SQLite, reached via
+    `AppHost.#appData()` (`this.ctx.facets.get(...)`). AppHost only holds CODE
+    (plus the realtime `__room__` scope). This changes WHERE the bytes live, not
+    HOW they're reached: the untrusted app still can't touch the facet directly —
+    the broker's scoped stubs validate/quota/sanitise every call, and AppHost
+    forwards it in. Facets add isolation; the broker keeps policy. The facet class
+    is TRUSTED framework code (`src/agent/facet/entry.ts`), delivered via the
+    Worker Loader (`getDurableObjectClass`) and loaded with `nodejs_compat`
+    (dofs needs `node:crypto`/`node:events`). Regenerate the bundle with
+    `npm run build:facet` after editing the facet or bumping vendored dofs.
+
 ## The runtime contract apps must follow
 
 Default export `fetch(request, env)`; HTML page at `/`; persist via
@@ -195,6 +222,11 @@ Chat/Code/History tools. A second room id stays fully isolated, and bare
 type a request in the **Chat** panel, and watch the tool-call chips + the live
 preview update as it edits (each edit becomes a new version).
 
+`dev`, `start`, `deploy`, and `typecheck` are preceded by `build:facet` (an
+esbuild step that bundles `src/agent/facet/entry.ts` + tree-shaken dofs into
+`src/agent/facet/bundle.generated.ts`), so the facet source is always fresh. Run
+`npm run build:facet` manually if you edit the facet outside those commands.
+
 After editing `wrangler.jsonc`, run `npm run types` to regenerate
 `worker-configuration.d.ts`.
 
@@ -207,12 +239,27 @@ After editing `wrangler.jsonc`, run `npm run types` to regenerate
 - **`@cloudflare/think` is EXPERIMENTAL** (Session is imported from
   `agents/experimental/memory/session`). It pulls heavy deps (`ai` v6 — pin
   `^6`, NOT v7; `zod` v4; `@cloudflare/shell`; codemode; just-bash), so the
-  bundle is large (~5 MB gzip). We install the minimal set — no React /
-  `@cloudflare/ai-chat` (vanilla client) and Think's code-execution/browser/
-  extension tools stay unused. `Think` peer-depends on `agents >=0.17.1`, which
-  our pinned `0.17.3` satisfies (no bump needed; vendored dofs has no `agents`
-  dep). `CodeAssistant` is a new SQLite DO — its migration is `tag: "v2"` in
-  `wrangler.jsonc`.
+  bundle is large (~5 MB gzip, and this dominates the host bundle). We install the
+  minimal set — no React / `@cloudflare/ai-chat` (vanilla client) and Think's
+  code-execution/browser/extension tools stay unused. `Think` peer-depends on
+  `agents >=0.17.1`, which our pinned `0.17.3` satisfies (no bump needed; vendored
+  dofs has no `agents` dep). `CodeAssistant` is a new SQLite DO — its migration is
+  `tag: "v2"` in `wrangler.jsonc`.
+- **App runtime data lives in a facet (`AppStorageFacet`), not AppHost.** Both the
+  key/value store and the dofs filesystem run in the facet's own isolated SQLite;
+  AppHost's `store*`/`fs*` methods are thin forwarders. Only the realtime
+  `__room__` scope stays in AppHost's `app_data` table. dofs is bundled INTO the
+  facet (tree-shaken) so it no longer executes in the host isolate — but the
+  ~28 KiB facet source still ships embedded as a string in the host bundle (it
+  must, to hand to the Worker Loader), so the host-bundle trim is modest (~30 KB).
+  Existing local rooms with pre-facet `app_data` KV won't be seen by the facet —
+  use a fresh room id (or clear `.wrangler/`).
+- **Dynamic Worker observability via a Tail Worker.** `DynamicWorkerTail`
+  (exported from `server.ts`, attached in `runner.ts` via `tails: [...]`) re-emits
+  each untrusted app run's `console.log()`/exceptions/outcome into Workers Logs,
+  tagged with `workerId`. Requires `observability.head_sampling_rate: 1` in
+  `wrangler.jsonc` so nothing is sampled out. A Dynamic Worker's own logs are NOT
+  captured without this — they run in a separate context.
 - **Line-addressed edits** (`src/author/workers-ai-author.ts`): `applyEdits`
   applies `{path, op, start, end, body}` ops bottom-up (original line numbers stay
   valid), validates bounds/overlap, and throws a clear, model-actionable message

@@ -1,15 +1,14 @@
 import { Agent } from "agents";
 import type { Connection, ConnectionContext, WSMessage } from "agents";
-import {
-  Database,
-  type DurableObjectStorageLike,
-  initializeSchema,
-  WorkspaceFilesystem,
-  type WorkspaceFsError
-} from "@cloudflare/dofs";
 import type { Env, FsDirent, FsFound, FsGrepMatch, FsStat } from "../types";
 import type { AppFile } from "../templates/types";
 import { getTemplate, DEFAULT_TEMPLATE_ID } from "../templates/registry";
+import {
+  APP_STORAGE_FACET_NAME,
+  APP_STORAGE_FACET_SOURCE,
+  APP_STORAGE_FACET_WORKER_ID,
+  type AppStorageFacetStub
+} from "./app-storage-facet";
 import { bundleApp, runApp } from "./runner";
 import { RoomCoordinator } from "../realtime/coordinator";
 import type { ConnState, RoomHost } from "../realtime/coordinator";
@@ -59,40 +58,12 @@ const ROOM_SCOPE = "__room__";
  */
 const RELOAD_DEBOUNCE_MS = 750;
 
-/**
- * Per-file byte cap for the app filesystem capability.
- *
- * Deliberately modest (256 KiB): this filesystem is for small, structured
- * per-app data (notes, config, game history), NOT a blob store. Large binaries
- * belong in R2 via a future `requestBlobStore` broker hook — not here.
- */
-const MAX_FS_FILE_BYTES = 256 * 1024;
-
 /** Encode a string to a standalone ArrayBuffer (RPC-serializable body). */
 function encodeUtf8(text: string): ArrayBuffer {
   const bytes = new TextEncoder().encode(text);
   const buf = new ArrayBuffer(bytes.byteLength);
   new Uint8Array(buf).set(bytes);
   return buf;
-}
-
-/** True when a dofs error means "no such file/dir". */
-function isEnoent(err: unknown): boolean {
-  return (
-    typeof err === "object" &&
-    err !== null &&
-    (err as Partial<WorkspaceFsError>).code === "ENOENT"
-  );
-}
-
-/** Collapse a dofs node's type booleans into a simple tag. */
-function direntType(node: {
-  isDirectory: boolean;
-  isSymbolicLink: boolean;
-}): "file" | "dir" | "symlink" {
-  if (node.isDirectory) return "dir";
-  if (node.isSymbolicLink) return "symlink";
-  return "file";
 }
 
 export class AppHost extends Agent<Env, HostState> {
@@ -331,131 +302,80 @@ export class AppHost extends Agent<Env, HostState> {
     }
   }
 
-  // ── app_data callbacks (invoked by ScopedStore capability over RPC) ──
+  // ── app runtime data (invoked by the ScopedStore / ScopedFilesystem
+  //    capabilities over RPC) ──
+  //
+  // ALL of an app's runtime data — its key/value store AND its filesystem — lives
+  // in a FACET: a child Durable Object with its own isolated SQLite, separate
+  // from this supervisor's code/version store. These methods are the trusted
+  // forwarding layer: the broker's scoped stubs have already validated,
+  // quota-checked, and path-sanitised the call (see src/capabilities/), and
+  // AppHost forwards it into the facet. AppHost never exposes the facet directly,
+  // so host-side mediation is preserved while storage is isolated. (Only the
+  // realtime coordinator's own state stays in AppHost's SQLite, under __room__.)
 
+  /**
+   * Get (or resume) the app-data facet and return its RPC stub. `facets.get`
+   * only runs the callback on a cold/hibernated facet; otherwise it reuses the
+   * running one. The facet class is trusted framework code (it bundles the
+   * tree-shaken dofs filesystem layer) loaded through the Worker Loader — facets
+   * must come from `getDurableObjectClass`. `nodejs_compat` is required because
+   * dofs uses node:crypto/node:events.
+   */
+  #appData(): AppStorageFacetStub {
+    const env = this.env;
+    const facet = this.ctx.facets.get(APP_STORAGE_FACET_NAME, () => {
+      const worker = env.LOADER.get(APP_STORAGE_FACET_WORKER_ID, () => ({
+        compatibilityDate: "2026-01-01",
+        compatibilityFlags: ["nodejs_compat"],
+        mainModule: "facet.js",
+        modules: { "facet.js": APP_STORAGE_FACET_SOURCE },
+        // Trusted, but it needs no network — keep the hard sandbox default.
+        globalOutbound: null
+      }));
+      return { class: worker.getDurableObjectClass("AppStorageFacet") };
+    });
+    return facet as unknown as AppStorageFacetStub;
+  }
+
+  // key/value store
   async storeGet(scope: string, key: string): Promise<string | null> {
-    return db.appDataGet(this, scope, key);
+    return this.#appData().storeGet(scope, key);
   }
   async storePut(scope: string, key: string, value: string): Promise<void> {
-    db.appDataPut(this, scope, key, value);
+    await this.#appData().storePut(scope, key, value);
   }
   async storeDelete(scope: string, key: string): Promise<void> {
-    db.appDataDelete(this, scope, key);
+    await this.#appData().storeDelete(scope, key);
   }
   async storeList(scope: string): Promise<string[]> {
-    return db.appDataList(this, scope);
+    return this.#appData().storeList(scope);
   }
 
-  // ── app filesystem callbacks (invoked by ScopedFilesystem over RPC) ──
-  //
-  // Backed by @cloudflare/dofs: a SQLite-backed virtual filesystem living in
-  // THIS Durable Object's own storage (the vfs_* tables it creates sit beside
-  // our files/versions/app_data tables — no collision). We only use the local
-  // filesystem layer (Database + WorkspaceFilesystem); dofs's sync/RPC/git
-  // machinery is unused.
-  //
-  // Each app namespace gets its own subtree under `/<namespace>`. Callers reach
-  // these only through the broker-minted ScopedFilesystem capability, which has
-  // already sanitised the path (no `..`, no leading slash). We scope again here
-  // by prefixing, so the trusted host is the single place that decides where an
-  // app's bytes can land.
-
-  #fs?: WorkspaceFilesystem;
-
-  /** Lazily build the filesystem and ensure its schema exists (idempotent). */
-  #filesystem(): WorkspaceFilesystem {
-    if (!this.#fs) {
-      // The runtime DurableObjectStorage satisfies dofs's structural
-      // DurableObjectStorageLike; the cast bridges a generic-variance gap in
-      // the SQL cursor's row type (compatible at runtime).
-      const storage = this.ctx.storage as unknown as DurableObjectStorageLike;
-      const database = new Database(storage);
-      // CREATE TABLE IF NOT EXISTS for the vfs_* tables. Safe to run every time.
-      initializeSchema(database, Date.now);
-      this.#fs = new WorkspaceFilesystem(database);
-    }
-    return this.#fs;
-  }
-
-  /** Absolute VFS path for an app's namespace-relative path. */
-  #fsPath(namespace: string, path: string): string {
-    const rel = path.replace(/^\/+/, "");
-    return rel ? `/${namespace}/${rel}` : `/${namespace}`;
-  }
-
-  /** Strip the `/<namespace>` prefix off a VFS path on the way back to the app. */
-  #fsUnscope(namespace: string, absolutePath: string): string {
-    const root = `/${namespace}`;
-    if (absolutePath === root) return "/";
-    return absolutePath.startsWith(`${root}/`) ? absolutePath.slice(root.length) : absolutePath;
-  }
-
+  // filesystem (dofs runs inside the facet; these just forward)
   async fsReadFile(namespace: string, path: string): Promise<string | null> {
-    try {
-      return await this.#filesystem().readFile(this.#fsPath(namespace, path), "utf8");
-    } catch (err) {
-      if (isEnoent(err)) return null; // missing file -> null (like store.get)
-      throw err;
-    }
+    return this.#appData().fsReadFile(namespace, path);
   }
-
   async fsWriteFile(namespace: string, path: string, content: string): Promise<void> {
-    const bytes = new TextEncoder().encode(content).byteLength;
-    if (bytes > MAX_FS_FILE_BYTES) {
-      throw new Error(
-        `File too large (${bytes} bytes, max ${MAX_FS_FILE_BYTES}). ` +
-          "This filesystem is for small structured data, not large blobs."
-      );
-    }
-    const fs = this.#filesystem();
-    const absolute = this.#fsPath(namespace, path);
-    // dofs never auto-creates parents; create the directory chain first.
-    const parent = absolute.slice(0, absolute.lastIndexOf("/")) || "/";
-    if (parent !== "/") await fs.mkdir(parent, { recursive: true });
-    await fs.writeFile(absolute, content);
+    await this.#appData().fsWriteFile(namespace, path, content);
   }
-
   async fsReaddir(namespace: string, path: string): Promise<FsDirent[] | null> {
-    try {
-      const entries = await this.#filesystem().readdir(this.#fsPath(namespace, path));
-      return entries.map((e) => ({ name: e.name, type: direntType(e) }));
-    } catch (err) {
-      if (isEnoent(err)) return null;
-      throw err;
-    }
+    return this.#appData().fsReaddir(namespace, path);
   }
-
   async fsMkdir(namespace: string, path: string): Promise<void> {
-    await this.#filesystem().mkdir(this.#fsPath(namespace, path), { recursive: true });
+    await this.#appData().fsMkdir(namespace, path);
   }
-
   async fsRm(namespace: string, path: string, recursive: boolean): Promise<void> {
-    // force:true so removing a missing path is a no-op (like store.delete).
-    await this.#filesystem().rm(this.#fsPath(namespace, path), { recursive, force: true });
+    await this.#appData().fsRm(namespace, path, recursive);
   }
-
   async fsStat(namespace: string, path: string): Promise<FsStat | null> {
-    try {
-      const s = await this.#filesystem().stat(this.#fsPath(namespace, path));
-      return { type: direntType(s), size: s.size, mtime: s.mtime };
-    } catch (err) {
-      if (isEnoent(err)) return null;
-      throw err;
-    }
+    return this.#appData().fsStat(namespace, path);
   }
-
   async fsGrep(namespace: string, pattern: string, path: string): Promise<FsGrepMatch[]> {
-    const matches = await this.#filesystem().grep(pattern, this.#fsPath(namespace, path));
-    return matches.map((m) => ({
-      path: this.#fsUnscope(namespace, m.path),
-      line: m.line,
-      text: m.text
-    }));
+    return this.#appData().fsGrep(namespace, pattern, path);
   }
-
   async fsFind(namespace: string, dir: string, pattern?: string): Promise<FsFound[]> {
-    const found = await this.#filesystem().find(this.#fsPath(namespace, dir), pattern);
-    return found.map((f) => ({ path: this.#fsUnscope(namespace, f.path), type: f.type }));
+    return this.#appData().fsFind(namespace, dir, pattern);
   }
 
   // ── internals ──

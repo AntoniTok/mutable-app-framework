@@ -9,6 +9,9 @@ export { CodeAssistant } from "./assistant/code-assistant";
 export { CapabilityBroker } from "./capabilities/broker";
 export { ScopedStore } from "./capabilities/scoped-store";
 export { ScopedFilesystem } from "./capabilities/scoped-filesystem";
+// Tail Worker: captures logs/exceptions/outcome from the untrusted app's
+// Dynamic Worker runs into Workers Logs (attached in src/agent/runner.ts).
+export { DynamicWorkerTail } from "./observability/dynamic-worker-tail";
 
 // Each room is its own isolated app instance (one Durable Object per id, with
 // its own code + version history + realtime state). The room id is taken from

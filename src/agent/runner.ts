@@ -1,6 +1,7 @@
 import { exports } from "cloudflare:workers";
 import { createWorker } from "@cloudflare/worker-bundler";
 import type { CapabilityBroker, CapabilityBrokerProps } from "../capabilities/broker";
+import type { DynamicWorkerTailProps } from "../observability/dynamic-worker-tail";
 import type { AppFile } from "../templates/types";
 import type { Env } from "../types";
 
@@ -31,6 +32,7 @@ import type { Env } from "../types";
 // Self-referential access to this worker's exported entrypoints.
 type LoaderExports = {
   CapabilityBroker(options: { props: CapabilityBrokerProps }): CapabilityBroker;
+  DynamicWorkerTail(options: { props: DynamicWorkerTailProps }): Fetcher;
 };
 const runtimeExports = exports as unknown as LoaderExports;
 
@@ -209,7 +211,12 @@ function loadWorker(opts: {
         SYSTEM: runtimeExports.CapabilityBroker({ props: { instance } })
       },
       // Hard sandbox: no outbound network access.
-      globalOutbound: null
+      globalOutbound: null,
+      // Per-run observability: the app's Dynamic Worker runs in its own context,
+      // so its console.log()/exceptions/outcome would otherwise be discarded.
+      // This Tail Worker (defined in the host, which has Workers Logs enabled)
+      // captures them after each run and tags every entry with `workerId`.
+      tails: [runtimeExports.DynamicWorkerTail({ props: { workerId } })]
     };
   });
   return { worker, workerId };

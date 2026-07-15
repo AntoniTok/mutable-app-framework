@@ -6,7 +6,9 @@ import type { AppFile } from "../templates/types";
  * Three tables live in the Agent's own SQLite:
  *   - files:    the source code, one row per file per version
  *   - versions: the history list (enables rollback)
- *   - app_data: the running app's own key/value data (separate from its code)
+ *   - app_data: ONLY the realtime engine's `__room__` state (the coordinator's
+ *               own state). The app's OWN key/value + filesystem data now lives
+ *               in the AppStorageFacet's isolated SQLite, not here.
  *
  * Keeping the SQL in one place lets the Agent read like intentions
  * ("save a version", "get live files") instead of raw queries.
@@ -85,7 +87,8 @@ export function listVersions(agent: SqlAgent): VersionRow[] {
     SELECT id, ts, note FROM versions ORDER BY id DESC`;
 }
 
-// ── app_data (the running app's own storage, reached via the broker) ──
+// ── app_data (now only the realtime coordinator's __room__ state; the app's
+//    own store/filesystem moved to the AppStorageFacet) ──
 
 export function appDataGet(
   agent: SqlAgent,
