@@ -10,8 +10,6 @@ import {
 import type { Env, FsDirent, FsFound, FsGrepMatch, FsStat } from "../types";
 import type { AppFile } from "../templates/types";
 import { getTemplate, DEFAULT_TEMPLATE_ID } from "../templates/registry";
-import { WorkersAiAuthor } from "../author/workers-ai-author";
-import type { CodeAuthor } from "../author/types";
 import { bundleApp, runApp } from "./runner";
 import { RoomCoordinator } from "../realtime/coordinator";
 import type { ConnState, RoomHost } from "../realtime/coordinator";
@@ -49,11 +47,17 @@ export interface PreviewResult {
 
 const DEFAULT_ENTRYPOINT = "src/index.js";
 
-/** How many times the AI author may retry to fix its own build errors. */
-const MAX_AI_REPAIRS = 2;
-
 /** Reserved app_data scope for the realtime engine's own state (see coordinator). */
 const ROOM_SCOPE = "__room__";
+
+/**
+ * How long to wait for the live version to "settle" before telling connected
+ * clients to reload (see #broadcastReload). One AI turn may promote several
+ * times; this coalesces that burst into a single reload so players aren't
+ * interrupted repeatedly. Long enough to absorb a multi-step turn, short enough
+ * that others see the change promptly.
+ */
+const RELOAD_DEBOUNCE_MS = 750;
 
 /**
  * Per-file byte cap for the app filesystem capability.
@@ -101,20 +105,6 @@ export class AppHost extends Agent<Env, HostState> {
     templateId: DEFAULT_TEMPLATE_ID,
     lastError: null
   };
-
-  // Swappable AI author. Created lazily so a missing AI binding doesn't break
-  // non-AI paths.
-  #author?: CodeAuthor;
-  #getAuthor(): CodeAuthor {
-    if (!this.#author) {
-      this.#author = new WorkersAiAuthor(
-        this.env.AI,
-        this.env.AUTHOR_MODEL,
-        this.env.AUTHOR_TIMEOUT_MS
-      );
-    }
-    return this.#author;
-  }
 
   async onStart(props?: { template?: string }): Promise<void> {
     db.createTables(this);
@@ -192,6 +182,10 @@ export class AppHost extends Agent<Env, HostState> {
 
   #room?: RoomCoordinator;
 
+  // Debounce state for the live-reload broadcast (see #broadcastReload).
+  #reloadTimer?: ReturnType<typeof setTimeout>;
+  #pendingReloadVersion?: number;
+
   #coordinator(): RoomCoordinator {
     if (!this.#room) this.#room = new RoomCoordinator(this.#roomHost());
     return this.#room;
@@ -266,12 +260,20 @@ export class AppHost extends Agent<Env, HostState> {
     // Validate by building. Only promote to live if the build succeeds.
     try {
       await bundleApp(files, this.entrypoint());
+      const previousVersion = this.state.activeVersion;
       this.setState({
         ...this.state,
         activeVersion: version,
         status: "ready",
         lastError: null
       });
+      // The live code changed. Tell every connected client to reload so it picks
+      // up the new page/app — otherwise only the tab that made the edit (which
+      // reloads its own preview) would see it; everyone else would run stale code
+      // until a manual refresh. Skip the very first seed (nothing to reload yet).
+      if (previousVersion !== version && previousVersion !== 0) {
+        this.#broadcastReload(version);
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // Keep the live pointer on the last good version; flag the failure.
@@ -280,93 +282,42 @@ export class AppHost extends Agent<Env, HostState> {
     return version;
   }
 
-  /** Ask the AI author to rewrite the app, then save the result (AI path). */
-  async editWithAI(instruction: string): Promise<number> {
-    this.setState({ ...this.state, status: "building", lastError: null });
-    try {
-      // Hold an alarm-backed heartbeat for the whole generation. AI edits stream
-      // a model response and may run several seconds (plus self-heal retries and
-      // build validations); without this the Durable Object can be idle-evicted
-      // mid-flight (see the Agents SDK's keepAlive docs — AIChatAgent does the
-      // same around its streams). keepAliveWhile auto-disposes on success/throw.
-      return await this.keepAliveWhile(async () => {
-        const template = getTemplate(this.state.templateId);
-        const author = this.#getAuthor();
-        const base = this.currentFilesSync();
-
-        // Self-heal loop. Two kinds of failure are fed back to the author and
-        // retried (up to MAX_AI_REPAIRS times), because both are usually a small
-        // model slip:
-        //   - APPLY failure — a line op referenced a nonexistent line. We
-        //     re-attempt against the ORIGINAL files with the mismatch as feedback.
-        //   - BUILD failure — the applied code doesn't compile. We ask the author
-        //     to fix the BROKEN files with the exact build error as feedback.
-        // We only save (setFiles) the final result, so retries don't spam versions.
-        let candidate: AppFile[] | null = null;
-        let repairBase = base;
-        let feedback: string | null = null;
-
-        for (let attempt = 0; attempt <= MAX_AI_REPAIRS; attempt++) {
-          let produced: AppFile[];
-          try {
-            produced =
-              feedback === null
-                ? await author.edit({ instruction, files: base, declares: template.declares })
-                : await author.repair({
-                    instruction,
-                    files: repairBase,
-                    error: feedback,
-                    declares: template.declares
-                  });
-          } catch (genErr) {
-            // Generation/apply failure: retry against the original files.
-            feedback = genErr instanceof Error ? genErr.message : String(genErr);
-            repairBase = base;
-            if (attempt === MAX_AI_REPAIRS) throw genErr;
-            continue;
-          }
-
-          candidate = produced;
-          const buildErr = await this.#buildError(produced);
-          if (!buildErr) return await this.setFiles(produced, `ai: ${instruction}`);
-
-          // Built but broken: fix the broken files next time.
-          feedback = buildErr;
-          repairBase = produced;
-          if (attempt === MAX_AI_REPAIRS) break;
-        }
-
-        // Out of retries: save the last candidate (broken) so it can be inspected;
-        // setFiles keeps the live pointer on the last good version and flags error.
-        if (!candidate) throw new Error("AI produced no usable output.");
-        return await this.setFiles(candidate, `ai: ${instruction}`);
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      // Keep the previous version intact; just record the failure.
-      this.setState({ ...this.state, status: "error", lastError: message });
-      throw err;
-    }
-  }
-
-  /** Build a file set to check it compiles; returns the error message or null. */
-  async #buildError(files: AppFile[]): Promise<string | null> {
-    try {
-      await bundleApp(files, this.entrypoint());
-      return null;
-    } catch (err) {
-      return err instanceof Error ? err.message : String(err);
-    }
-  }
-
   /** Move the live pointer to an older version. */
   async rollback(version: number): Promise<void> {
     if (!db.versionExists(this, version)) {
       throw new Error(`Version ${version} does not exist.`);
     }
+    const previousVersion = this.state.activeVersion;
     this.setState({ ...this.state, activeVersion: version });
     // Reflect whether the version we rolled back to actually builds.
     await this.validateActive();
+    // Rolling back also changes the live code — propagate to all clients.
+    if (previousVersion !== version) this.#broadcastReload(version);
+  }
+
+  /**
+   * Tell every connected client the live version changed so it reloads and runs
+   * the new code. The realtime channel normally carries only game STATE, so
+   * without this signal other players keep executing the previously-loaded page
+   * until a manual refresh. A client that reconnects re-seeds fresh state via the
+   * coordinator's version check. Apps opt in by handling the reserved
+   * `{ type: "reload" }` frame (the example templates do).
+   *
+   * DEBOUNCED: a single AI turn can promote more than once (e.g. a save plus a
+   * follow-up fix). Reloading players on each promote would flicker/interrupt
+   * them repeatedly, so we coalesce a burst into ONE reload on the LATEST good
+   * version, fired only after `RELOAD_DEBOUNCE_MS` of quiet. Each new promote
+   * resets the timer.
+   */
+  #broadcastReload(version: number): void {
+    this.#pendingReloadVersion = version;
+    if (this.#reloadTimer !== undefined) clearTimeout(this.#reloadTimer);
+    this.#reloadTimer = setTimeout(() => {
+      this.#reloadTimer = undefined;
+      const v = this.#pendingReloadVersion;
+      this.#pendingReloadVersion = undefined;
+      if (v !== undefined) this.broadcast(JSON.stringify({ type: "reload", version: v }));
+    }, RELOAD_DEBOUNCE_MS);
   }
 
   /** Try to build the live version; set status to ready or error accordingly. */

@@ -104,17 +104,19 @@ const PAGE = [
   'var seatEl=document.getElementById("seat");',
   'var cells=[];',
   'for(var i=0;i<9;i++){(function(i){var d=document.createElement("div");d.className="cell";d.onclick=function(){move(i);};grid.appendChild(d);cells.push(d);})(i);}',
-  // Per-TAB identity: sessionStorage is scoped to a single tab, so two tabs are
-  // two players; a refresh in the same tab keeps its seat.
-  'var token=sessionStorage.getItem("ttt-token");',
-  'if(!token){token=Math.random().toString(36).slice(2)+Date.now().toString(36);sessionStorage.setItem("ttt-token",token);}',
+  // Stable identity: ?player=<id> (explicit, multi-tab friendly) beats the
+  // per-browser id in localStorage (survives tab close/restart => resume seat).
+  'var _pl=new URLSearchParams(location.search).get("player");',
+  'var token=_pl||localStorage.getItem("ttt-token");',
+  'if(!token){token=Math.random().toString(36).slice(2)+Date.now().toString(36);}',
+  'if(!_pl){localStorage.setItem("ttt-token",token);}',
   'var mySeat=null,ws=null,last=null;',
   // Self-locate the room from our own URL (?room=abc), so one page serves any
   // room. Missing/blank => "main" (matches the host default).
   'function roomId(){var r=new URLSearchParams(location.search).get("room");return r||"main";}',
   'function agentUrl(){var proto=location.protocol==="https:"?"wss":"ws";return proto+"://"+location.host+"/agents/app-host/"+encodeURIComponent(roomId())+"?token="+encodeURIComponent(token);}',
   'function connect(){ws=new WebSocket(agentUrl());ws.onmessage=onMsg;ws.onclose=function(){seatEl.textContent="reconnecting…";setTimeout(connect,1000);};}',
-  'function onMsg(e){var m;try{m=JSON.parse(e.data);}catch(err){return;}if(m.type==="welcome"){mySeat=m.seat;}else if(m.type==="state"){last=m;render(m.state,m.players);}}',
+  'function onMsg(e){var m;try{m=JSON.parse(e.data);}catch(err){return;}if(m.type==="welcome"){mySeat=m.seat;}else if(m.type==="state"){last=m;render(m.state,m.players);}else if(m.type==="reload"){location.reload();}}',
   'function dot(on){return on?"\u25CF":"\u25CB";}',
   'function seatLabel(players){var who=mySeat?("You are "+mySeat):"Spectator";return who+"   X "+dot(players&&players.X)+"  O "+dot(players&&players.O);}',
   'function render(s,players){',

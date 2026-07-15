@@ -13,8 +13,12 @@
   },
   "dependencies": {
     "@cloudflare/dofs": "file:./vendor/dofs",
+    "@cloudflare/think": "^0.13.0",
     "@cloudflare/worker-bundler": "^0.2.1",
-    "agents": "^0.17.3"
+    "agents": "^0.17.3",
+    "ai": "^6.0.225",
+    "workers-ai-provider": "^3.3.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

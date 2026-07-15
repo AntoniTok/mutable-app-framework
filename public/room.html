@@ -66,6 +66,18 @@
       li.active-version { color: var(--accent); }
       li .meta { color: var(--muted); }
       .hint { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
+      /* Chat panel */
+      #chatStatus { text-transform: none; letter-spacing: 0; font-weight: 400; }
+      .chat-log { flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; min-height: 120px; }
+      .msg { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+      .msg.user { border-color: var(--accent); background: rgba(47,129,247,0.08); }
+      .msg.assistant { background: var(--panel); }
+      .msg .who { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+      .msg .tools { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; }
+      .tool-chip { font-size: 11px; color: var(--muted); border-left: 2px solid var(--border); padding: 1px 0 1px 8px; font-family: inherit; }
+      .tool-chip.done { color: var(--ok); border-color: var(--ok); }
+      .tool-chip.err { color: var(--err); border-color: var(--err); }
+      #chatInput { flex: 1; resize: vertical; }
     </style>
   </head>
   <body>
@@ -79,7 +91,7 @@
       <span id="status" class="edit-only">loading…</span>
       <span id="version" class="edit-only"></span>
       <button class="ghost on edit-only" id="toggleControls">Controls</button>
-      <button class="ghost on edit-only" id="toggleAi">Ask AI</button>
+      <button class="ghost on edit-only" id="toggleChat">Chat</button>
       <button class="ghost edit-only" id="toggleCode">Code</button>
       <button class="ghost edit-only" id="toggleHistory">History</button>
     </header>
@@ -100,14 +112,6 @@
             style="flex:1; border:0; background:#fff;"
             sandbox="allow-scripts allow-forms allow-same-origin"></iframe>
           <pre id="preview" style="display:none;">Run the app to see output…</pre>
-        </div>
-        <div class="section edit-only" id="aiSection">
-          <h2>Ask AI to edit</h2>
-          <div class="row">
-            <input id="prompt" placeholder="e.g. add a /reset endpoint that sets count to 0" />
-            <button id="ask">Ask AI</button>
-          </div>
-          <p class="hint" id="aiHint">The AI rewrites the code in this room, saves a new version, and the next run uses it.</p>
         </div>
       </div>
 
@@ -130,6 +134,19 @@
         <div class="section grow">
           <h2>Versions</h2>
           <ul id="versions"></ul>
+        </div>
+      </div>
+
+      <!-- Drawer: AI chat. The agentic coding assistant (Think). Open by default
+           in edit mode; toggle with "Chat". -->
+      <div class="col drawer edit-only" id="chatDrawer">
+        <div class="section grow">
+          <h2>AI coding assistant <span id="chatStatus" class="meta"></span></h2>
+          <div id="chatLog" class="chat-log"></div>
+          <div class="row" style="margin-top:8px;">
+            <textarea id="chatInput" rows="2" placeholder="Describe a change, or ask about the app… (Enter to send, Shift+Enter for newline)"></textarea>
+            <button id="chatSend">Send</button>
+          </div>
         </div>
       </div>
     </main>
@@ -155,12 +172,32 @@
       $("roomLabel").textContent = ROOM;
       document.title = "Room " + ROOM;
 
+      // Per-TAB player identity. Each tab gets its own id so opening the room in
+      // several tabs = several players. We write it into THIS tab's address bar
+      // (replaceState, no navigation) so it survives a reload and a "reopen
+      // closed tab" — restoring the URL restores the id, which resumes the seat.
+      // A freshly-typed room URL (no player=) mints a new id => a new player.
+      // The "Copy link" button intentionally omits player=, so sharing the room
+      // never clones your seat onto someone else.
+      const PLAYER = (() => {
+        const params = new URLSearchParams(location.search);
+        let p = (params.get("player") || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+        if (!p) {
+          p = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(36).slice(2)).replace(/[^A-Za-z0-9_-]/g, "");
+          params.set("player", p);
+          history.replaceState(null, "", location.pathname + "?" + params.toString() + location.hash);
+        }
+        return p;
+      })();
+
       // ── Edit mode: reveal/hide all editor chrome. Off by default so a fresh
       // room is just the game.
       $("editToggle").onclick = () => {
         const editing = document.body.classList.toggle("editing");
         $("editToggle").textContent = editing ? "Done" : "Edit";
         $("editToggle").classList.toggle("on", editing);
+        // Open the assistant connection the first time the tools are revealed.
+        if (editing) Chat.connect();
       };
 
       $("copyLink").onclick = async () => {
@@ -185,15 +222,15 @@
       }
       $("toggleCode").onclick = () => toggleDrawer("codeDrawer", $("toggleCode"));
       $("toggleHistory").onclick = () => toggleDrawer("historyDrawer", $("toggleHistory"));
+      $("toggleChat").onclick = () => toggleDrawer("chatDrawer", $("toggleChat"));
 
-      // Toggle in-column sections (top controls bar + Ask AI bar). Visible by
-      // default in edit mode; hiding them gives the preview more room.
+      // Toggle in-column sections (top controls bar). Visible by default in edit
+      // mode; hiding it gives the preview more room.
       function toggleSection(id, btn) {
         const hidden = $(id).classList.toggle("is-hidden");
         btn.classList.toggle("on", !hidden);
       }
       $("toggleControls").onclick = () => toggleSection("controlsSection", $("toggleControls"));
-      $("toggleAi").onclick = () => toggleSection("aiSection", $("toggleAi"));
 
       // ── File editor ──
       function currentIndex() {
@@ -238,12 +275,6 @@
         el.textContent = s.status;
         el.className = s.status + " edit-only";
         $("version").textContent = "live: v" + s.activeVersion;
-        if (s.status === "error" && s.lastError) {
-          $("aiHint").textContent = "Last error: " + s.lastError;
-          $("aiHint").style.color = "var(--err)";
-        } else {
-          $("aiHint").style.color = "var(--muted)";
-        }
       }
 
       async function loadVersions() {
@@ -287,28 +318,191 @@
 
       $("reload").onclick = async () => { await syncAll(); $("saveHint").textContent = "reloaded"; };
 
-      $("ask").onclick = async () => {
-        const instruction = $("prompt").value.trim();
-        if (!instruction) return;
-        $("ask").disabled = true; $("ask").textContent = "thinking…";
-        try {
-          await api("/api/edit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ instruction }) });
-          $("prompt").value = "";
-        } catch (e) {
-          alert("AI edit failed: " + e.message);
-        } finally {
-          $("ask").disabled = false; $("ask").textContent = "Ask AI";
-          // Always refresh + re-render — on success to show the new code/UI, on
-          // failure to show the error status and confirm code is unchanged.
-          await syncAll();
+      // ── AI coding assistant (Think) ──
+      // A per-room CodeAssistant Durable Object, reached over the Agents chat
+      // WebSocket protocol (cf_agent_chat_*). It calls host-side tools that edit
+      // THIS room's app through the build-gated version store, so any change it
+      // makes shows up in the live preview / history exactly like a manual edit.
+      const Chat = (() => {
+        let ws = null;
+        let committed = [];   // authoritative transcript from the server
+        let pending = null;   // optimistic user message for the in-flight turn
+        let live = null;      // streaming assistant message for the in-flight turn
+        let busy = false;
+        let reqId = null;
+
+        function wsUrl() {
+          const proto = location.protocol === "https:" ? "wss" : "ws";
+          return proto + "://" + location.host + "/agents/code-assistant/" +
+            encodeURIComponent(ROOM);
         }
-      };
+
+        function setStatus(t) { $("chatStatus").textContent = t ? "— " + t : ""; }
+
+        function connect() {
+          if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+          setStatus("connecting…");
+          ws = new WebSocket(wsUrl());
+          ws.addEventListener("open", () => setStatus(""));
+          ws.addEventListener("close", () => setStatus("disconnected"));
+          ws.addEventListener("error", () => setStatus("connection error"));
+          ws.addEventListener("message", onFrame);
+        }
+
+        // Convert a stored UIMessage (from cf_agent_chat_messages) to our shape.
+        function fromUiMessage(m) {
+          const text = (m.parts || []).filter((p) => p.type === "text").map((p) => p.text).join("");
+          const tools = (m.parts || [])
+            .filter((p) => typeof p.type === "string" && (p.type.startsWith("tool-") || p.type === "dynamic-tool"))
+            .map((p) => ({
+              name: p.toolName || (p.type.startsWith("tool-") ? p.type.slice(5) : "tool"),
+              input: p.input, output: p.output,
+              ok: p.state ? p.state !== "output-error" : true
+            }));
+          return { role: m.role, text, tools };
+        }
+
+        function onFrame(ev) {
+          let m; try { m = JSON.parse(ev.data); } catch { return; }
+          if (m.type === "cf_agent_chat_messages") {
+            // The SERVER is the single source of truth for the transcript. Adopt
+            // its authoritative history and drop our optimistic overlays that it
+            // now contains (this is what prevents duplicated/re-pasted prompts).
+            committed = (m.messages || []).map(fromUiMessage).filter((x) => x.role === "user" || x.role === "assistant");
+            pending = null;
+            if (!busy) live = null;
+            render();
+            return;
+          }
+          if (m.type !== "cf_agent_use_chat_response" || m.id !== reqId) return;
+          if (m.error) { finishTurn("error: " + (m.body || "unknown")); return; }
+          if (m.body && m.body.trim()) {
+            try { handleChunk(JSON.parse(m.body)); } catch {}
+          }
+          if (m.done) finishTurn();
+        }
+
+        // AI SDK UIMessageChunk stream → the live assistant bubble.
+        function handleChunk(c) {
+          if (!live) live = { role: "assistant", text: "", tools: [] };
+          switch (c.type) {
+            case "text-delta": live.text += (c.delta || c.text || ""); break;
+            case "tool-input-available":
+            case "tool-call": {
+              const name = c.toolName || c.toolCallName || "tool";
+              live.tools.push({ name, input: c.input || c.args, output: undefined, ok: undefined, id: c.toolCallId });
+              break;
+            }
+            case "tool-output-available":
+            case "tool-result": {
+              const t = [...live.tools].reverse().find((x) => x.output === undefined && (!c.toolCallId || x.id === c.toolCallId));
+              if (t) { t.output = c.output ?? c.result; t.ok = !(t.output && t.output.error) && !(t.output && t.output.applied === false); }
+              break;
+            }
+          }
+          render();
+        }
+
+        function newId() { return crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()); }
+
+        function send() {
+          const text = $("chatInput").value.trim();
+          if (!text || busy) return;
+          connect();
+          const doSend = () => {
+            reqId = newId();
+            // Send ONLY the new user message — the server already holds the rest
+            // of the conversation (Session) and uses it as context. Re-sending the
+            // whole transcript (esp. with fresh ids) is what caused duplicates.
+            const userMsg = { id: newId(), role: "user", parts: [{ type: "text", text }] };
+            pending = { role: "user", text, tools: [] };
+            live = null;
+            busy = true; setStatus("thinking…"); $("chatSend").disabled = true;
+            $("chatInput").value = "";
+            render();
+            ws.send(JSON.stringify({
+              id: reqId,
+              init: { method: "POST", body: JSON.stringify({ messages: [userMsg], trigger: "submit-user-message" }) },
+              type: "cf_agent_use_chat_request"
+            }));
+          };
+          if (ws.readyState === WebSocket.OPEN) doSend();
+          else ws.addEventListener("open", doSend, { once: true });
+        }
+
+        async function finishTurn(errText) {
+          busy = false;
+          $("chatSend").disabled = false;
+          // If the model produced nothing visible, say so instead of a blank bubble.
+          if (live && !live.text && (!live.tools || live.tools.length === 0)) {
+            live.text = "(the model stopped without a reply — try rephrasing, or ask for a smaller step)";
+          }
+          // Fold optimistic overlays into the transcript so nothing flickers before
+          // the server's authoritative cf_agent_chat_messages frame arrives.
+          if (pending) { committed.push(pending); pending = null; }
+          if (live) { committed.push(live); live = null; }
+          setStatus(errText || "");
+          render();
+          // A turn may have changed the live version — refresh preview/state/history.
+          try { await syncAll(); } catch {}
+        }
+
+        function render() {
+          const log = $("chatLog");
+          log.innerHTML = "";
+          const all = committed.concat(pending ? [pending] : [], live ? [live] : []);
+          for (const m of all) {
+            if (m.role !== "user" && m.role !== "assistant") continue;
+            const el = document.createElement("div");
+            el.className = "msg " + m.role;
+            const who = document.createElement("div");
+            who.className = "who";
+            who.textContent = m.role === "user" ? "you" : "assistant";
+            el.appendChild(who);
+            if (m.text) { const body = document.createElement("div"); body.textContent = m.text; el.appendChild(body); }
+            if (m.tools && m.tools.length) {
+              const tools = document.createElement("div");
+              tools.className = "tools";
+              for (const t of m.tools) {
+                const chip = document.createElement("div");
+                const done = t.output !== undefined;
+                chip.className = "tool-chip" + (done ? (t.ok ? " done" : " err") : "");
+                let label = "\u2699 " + t.name;
+                if (t.name === "apply_line_edits" || t.name === "save_version" || t.name === "reset_app") {
+                  if (done && t.output && typeof t.output.version === "number") {
+                    label += t.output.built ? "  \u2192 v" + t.output.version + " (live)" :
+                      "  \u2192 v" + t.output.version + " (build failed)";
+                  }
+                } else if (done && t.output && t.output.error) {
+                  label += "  \u2717";
+                }
+                chip.textContent = done ? label : label + "…";
+                tools.appendChild(chip);
+              }
+              el.appendChild(tools);
+            }
+            log.appendChild(el);
+          }
+          log.scrollTop = log.scrollHeight;
+        }
+
+        $("chatSend").onclick = send;
+        $("chatInput").addEventListener("keydown", (e) => {
+          if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+        });
+
+        return { connect };
+      })();
 
       let rendered = true; // "Rendered" (iframe) vs "Raw" (text) preview
 
       function previewUrl() {
         const path = $("path").value || "/";
-        return withRoom("/preview" + (path.startsWith("/") ? path : "/" + path));
+        let url = withRoom("/preview" + (path.startsWith("/") ? path : "/" + path));
+        // Forward this tab's per-tab player id to the app so each tab is a
+        // distinct player (and reload/reopen resumes the same seat).
+        if (PLAYER) url += "&player=" + encodeURIComponent(PLAYER);
+        return url;
       }
 
       $("viewMode").onclick = () => {

@@ -2,7 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "mutable-app-framework",
   "main": "src/server.ts",
-  "compatibility_date": "2026-06-11",
+  "compatibility_date": "2026-07-14",
   "compatibility_flags": ["nodejs_compat"],
 
   // Static UI (editor). The worker runs first for these dynamic paths;
@@ -16,14 +16,28 @@
   // Dynamic Worker Loader: lets the host load app code at runtime.
   "worker_loaders": [{ "binding": "LOADER" }],
 
-  // The AppHost Agent is a Durable Object: one instance = one mutable app.
+  // Durable Objects: one AppHost per room (the mutable app + its versions), and
+  // one CodeAssistant per room (the Think-based agentic coding assistant). Both
+  // are keyed by the room id; the assistant reaches its room's AppHost by RPC.
   "durable_objects": {
-    "bindings": [{ "name": "AppHost", "class_name": "AppHost" }]
+    "bindings": [
+      { "name": "AppHost", "class_name": "AppHost" },
+      { "name": "CodeAssistant", "class_name": "CodeAssistant" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AppHost"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AppHost"] },
+    { "tag": "v2", "new_sqlite_classes": ["CodeAssistant"] }
+  ],
 
   // Workers AI: used by the host-side AI author to rewrite app code.
   "ai": { "binding": "AI" },
+
+  // Model for the Think-based coding assistant. Must be a reliable tool-caller;
+  // glm-5.2 is an agentic-coding model. Overridable locally via .dev.vars.
+  "vars": {
+    "ASSISTANT_MODEL": "@cf/zai-org/glm-5.2"
+  },
 
   "observability": { "enabled": true }
 }

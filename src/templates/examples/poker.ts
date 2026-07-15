@@ -441,15 +441,25 @@ var PAGE = [
   'var potEl=document.getElementById("pot");var commEl=document.getElementById("community");',
   'var playersEl=document.getElementById("players");var mineEl=document.getElementById("mine");',
   'var controlsEl=document.getElementById("controls");',
-  'var token=sessionStorage.getItem("poker-token");',
-  'if(!token){token=Math.random().toString(36).slice(2)+Date.now().toString(36);sessionStorage.setItem("poker-token",token);}',
+  // Stable player identity so closing + reopening the tab resumes the SAME seat.
+  // Priority: an explicit ?player=<id> (lets you be distinct players in several
+  // tabs of one browser, or share a resume link) beats the per-browser identity
+  // in localStorage (which survives tab close AND browser restart). Only when
+  // neither exists do we mint a new id and remember it.
+  'var _pl=new URLSearchParams(location.search).get("player");',
+  'var token=_pl||localStorage.getItem("poker-token");',
+  'if(!token){token=Math.random().toString(36).slice(2)+Date.now().toString(36);}',
+  'if(!_pl){localStorage.setItem("poker-token",token);}',
   'var mySeat=null,ws=null,cur=null;',
   'function roomId(){var r=new URLSearchParams(location.search).get("room");return r||"main";}',
   'function agentUrl(){var proto=location.protocol==="https:"?"wss":"ws";return proto+"://"+location.host+"/agents/app-host/"+encodeURIComponent(roomId())+"?token="+encodeURIComponent(token);}',
   'function connect(){ws=new WebSocket(agentUrl());ws.onmessage=onMsg;ws.onclose=function(){seatEl.textContent="reconnecting…";setTimeout(connect,1000);};}',
   'function onMsg(e){var m;try{m=JSON.parse(e.data);}catch(err){return;}',
   '  if(m.type==="welcome"){mySeat=m.seat;if(mySeat)send({type:"sit"});}',
-  '  else if(m.type==="state"){cur=m.state;render(m.state,m.players);}}',
+  '  else if(m.type==="state"){cur=m.state;render(m.state,m.players);}',
+  // The framework sends this when the app is edited to a new live version, so
+  // every open client reloads and runs the new code (not just the editor).
+  '  else if(m.type==="reload"){location.reload();}}',
   'function send(action){if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:"action",action:action}));}',
   'function cardEl(c){var d=document.createElement("div");',
   '  if(c===null){d.className="card back";d.textContent="\\u2605";return d;}',

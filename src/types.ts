@@ -1,14 +1,22 @@
 import type { AppHost } from "./agent/app-host";
+import type { CodeAssistant } from "./assistant/code-assistant";
 
 /** Bindings available to the host worker (declared in wrangler.jsonc). */
 export interface Env {
   AppHost: DurableObjectNamespace<AppHost>;
+  /** The per-room agentic coding assistant (Think). One instance per room id. */
+  CodeAssistant: DurableObjectNamespace<CodeAssistant>;
   LOADER: WorkerLoader;
   AI: Ai;
-  /** Optional model override for the AI author. */
+  /** Optional model override for the AI author (one-shot line-edit path). */
   AUTHOR_MODEL?: string;
   /** Optional overall timeout (ms) for one AI edit. Default 120000. */
   AUTHOR_TIMEOUT_MS?: string;
+  /** Model for the Think coding assistant (tool-calling chat). Pinned in
+   *  wrangler.jsonc `vars`; overridable locally via .dev.vars. */
+  ASSISTANT_MODEL: string;
+  /** Optional reasoning effort for the assistant model: "low" | "medium" | "high". */
+  ASSISTANT_REASONING_EFFORT?: string;
 }
 
 /**

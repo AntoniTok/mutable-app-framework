@@ -5,6 +5,7 @@ import type { AppHost } from "./agent/app-host";
 // The Agent + capability entrypoints must be exported from the main module so
 // the runtime can instantiate them (DO) and mint stubs (WorkerEntrypoint).
 export { AppHost } from "./agent/app-host";
+export { CodeAssistant } from "./assistant/code-assistant";
 export { CapabilityBroker } from "./capabilities/broker";
 export { ScopedStore } from "./capabilities/scoped-store";
 export { ScopedFilesystem } from "./capabilities/scoped-filesystem";
@@ -57,12 +58,6 @@ async function handleApi(
       const body = (await request.json()) as { files?: unknown; note?: string };
       if (!Array.isArray(body.files)) return errorResponse("files[] required", 400);
       const version = await agent.setFiles(body.files as never, body.note);
-      return json({ version });
-    }
-    if (path === "/api/edit" && request.method === "POST") {
-      const body = (await request.json()) as { instruction?: string };
-      if (!body.instruction) return errorResponse("instruction required", 400);
-      const version = await agent.editWithAI(body.instruction);
       return json({ version });
     }
     if (path === "/api/reset" && request.method === "POST") {

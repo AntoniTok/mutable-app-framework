@@ -20,20 +20,22 @@ the app — by hand or by asking an AI — and the next request runs the new cod
 Browser ─── HTTP ──▶│  server.ts → AppHost (Durable Object, one per room)        │
  lobby + room UI    │    • stores app source + version history in its own SQLite │
                     │    • runs the live version in a sandbox (runner.ts)        │
-                    │    • rewrites the app via an AI author (host-side)         │
-                    │  contracts:  CodeAuthor        AppTemplate + fetch()       │
+                     │    • edits the app via an AI assistant (host-side)        │
+                    │  contracts:  AppHost RPC        AppTemplate + fetch()      │
                     └──────▲───────────────────────────────────▲─────────────────┘
-                           │ implements                        │ conforms to
-                     AI author (swappable)              app templates (swappable,
-                     Workers AI / OpenAI / …            include their own UI)
+                           │ tool-calls (RPC)                  │ conforms to
+                     AI assistant (Think DO)            app templates (swappable,
+                     agentic + memory                   include their own UI)
 ```
 
 Three layers, two of them swappable:
 
 1. **Stable core** — stores code, runs code, mutates code, sandboxes code. Never
    changes when you swap apps or models.
-2. **AI author** (swappable) — turns an instruction + current files into new
-   files. Behind the `CodeAuthor` interface.
+2. **AI assistant** — a separate per-room Durable Object (`CodeAssistant extends
+   Think`) that edits the app through a multi-turn, agentic, memory-aware chat.
+   It only ever touches app code through the core's `AppHost` RPC (build-gated),
+   so it stays trusted host-side code on the safe side of the sandbox.
 3. **App templates** (swappable) — the actual apps, incl. their own UI. Behind
    the `AppTemplate` interface + the runtime contract.
 
@@ -64,8 +66,10 @@ Open http://localhost:8787 — the **lobby**. Each room is its own isolated app
 - **Join room** — enter an existing id to open that room.
 
 A room opens at `/room.html?room=<id>` on the **live app** (the game); open it
-in two tabs to play multiplayer. Press **Edit** in the room to reveal the tools
-(they stay hidden otherwise). No `?room=` anywhere defaults to room `main`.
+in two tabs to play multiplayer — each tab is its own player (see
+[player identity](#player-identity-reconnection)). Press **Edit** in the room to
+reveal the tools (they stay hidden otherwise). No `?room=` anywhere defaults to
+room `main`.
 
 The room's **Edit** tools let you:
 
@@ -73,21 +77,23 @@ The room's **Edit** tools let you:
 - **Rendered / Raw** — render the app's HTML page, or show the raw response.
 - **Reset app** — re-seed from the template (clean slate; keeps history).
 - **Save** (Code panel) — save the edited files as a new version.
-- **Ask AI** (Ask AI panel) — describe a change; the AI rewrites the code and
-  saves a version.
+- **Chat** (Chat panel) — talk to the AI coding assistant; it edits the app for
+  you across a multi-turn conversation (see below), saving versions as it goes.
 - **rollback** (History panel) — move the live pointer to any past version.
 
 In Edit mode each panel is togglable from the header, so you can hide what you
 don't need and give the live app more room:
 
 - **Controls** — the Run / Rendered / Reset bar.
-- **Ask AI** — the AI edit bar.
+- **Chat** — the AI coding assistant (conversational, agentic).
 - **Code** — the file editor.
 - **History** — the version list.
 
 Press **Edit** again (**Done**) to hide the tools and go back to just the app.
-The rendered preview auto-refreshes after every change (save / AI edit / reset /
-rollback), so what you see always matches the live version.
+The rendered preview auto-refreshes after every change (save / AI chat turn /
+reset / rollback), so what you see always matches the live version. And when a
+change promotes a new live version, **every connected client auto-reloads** too
+(not just the tab that made the edit) — see [live reload](#live-reload).
 
 ### Scripts
 
@@ -110,7 +116,7 @@ src/
 
   agent/
     app-host.ts                THE AGENT (Durable Object): stores/versions code,
-                               runs it, editWithAI / setFiles / rollback / reset;
+                               runs it, setFiles / rollback / reset / preview;
                                also hosts the dofs filesystem (fs* RPC methods).
     schema.ts                  SQLite tables (files, versions, app_data) + helpers.
                                The app's private filesystem adds its own dofs
@@ -129,9 +135,18 @@ src/
     scoped-filesystem.ts       Per-app filesystem (namespace-scoped, path-sanitised)
                                backed by @cloudflare/dofs over the room's SQLite.
 
+  assistant/
+    code-assistant.ts          THE AI CODING ASSISTANT: a separate Durable Object
+                               (CodeAssistant extends Think, @cloudflare/think).
+                               One per room; runs the agentic tool-calling loop
+                               with per-room memory. Its host-side tools edit the
+                               room's app ONLY via AppHost (build-gated setFiles).
+
   author/
-    types.ts                   CodeAuthor interface (the swappable-AI seam).
-    workers-ai-author.ts       Workers AI implementation (runs host-side).
+    types.ts                   CodeAuthor interface (legacy one-shot seam).
+    workers-ai-author.ts       Line-edit engine (parseEdits/applyEdits) reused by
+                               the assistant's apply_line_edits tool. The old
+                               one-shot WorkersAiAuthor is kept but unwired.
 
   templates/
     types.ts                   AppTemplate interface + the RUNTIME CONTRACT
@@ -157,7 +172,8 @@ public/
   room.html                    A room: live app + on-demand editor ("Edit"),
                                at /room.html?room=<id>.
 
-wrangler.jsonc                 Bindings: AppHost DO, LOADER, AI, static assets.
+wrangler.jsonc                 Bindings: AppHost + CodeAssistant DOs, LOADER, AI,
+                               static assets, ASSISTANT_MODEL var.
 worker-configuration.d.ts      Generated binding/runtime types (npm run types).
 
 vendor/
@@ -181,23 +197,26 @@ Browser → server.ts (/preview/*) → AppHost.preview()
           app's relative links/buttons work inside the preview.
 ```
 
-**Change the app (AI)**
+**Change the app (AI — the assistant)**
 ```
-Browser "add X" → server.ts (/api/edit) → AppHost.editWithAI()
-        → WorkersAiAuthor: prompt(numbered current files + contract) → model →
-          LINE-EDIT ops (@@REPLACE/INSERT/DELETE/CREATE n@@) applied to the files
-          (small + fast; never a full-file rewrite) → new files
-        → self-heal: bundle to validate; on an APPLY error (op referenced a bad
-          line) or a BUILD error, feed it back to author.repair() and retry (up
-          to MAX_AI_REPAIRS) — validated, not saved
-        → AppHost.setFiles(): saves the final version, then bundles it.
+Browser Chat panel --ws--> /agents/code-assistant/<room> --> CodeAssistant (Think)
+        → agentic loop: model calls host-side TOOLS → reads results → loops
+            read_file / list_files / preview / list_versions / get_state   (read)
+            apply_line_edits (FAST path) / save_version / rollback / reset_app
+        → every edit tool calls AppHost.setFiles(): saves the version, bundles it.
           Only if it builds does the live pointer move (auto-promote); a broken
           build is saved but NOT promoted — the last good version stays live.
+        → the tool returns the build outcome; if it failed, the model reads the
+          error and makes a follow-up edit (self-heal IS the loop).
+        → per-room MEMORY (a writable Session context block) persists facts about
+          the app across turns; conversation history is stored + FTS5-searchable.
+        → on a successful promote, AppHost broadcasts {type:"reload"} (debounced)
+          so EVERY connected client reloads onto the new version (see Live reload).
         → next run uses the new code (or the old code, if the new one failed).
 ```
 
-**Change the app (manual)** — the editor calls `/api/files`; same as above minus
-the model.
+**Change the app (manual)** — the editor calls `/api/files`; saves + build-gates
+a new version, no model involved.
 
 **Rollback** — `/api/rollback` moves the live pointer to an older version.
 
@@ -291,19 +310,23 @@ check yet — test it by hand in the browser.
 
 ### Swap the AI model
 
-Implement `CodeAuthor` (see `src/author/types.ts`) in a new file (e.g. an OpenAI
-version) and use it in `AppHost.#getAuthor()`. Nothing else changes. The default
-model is configurable via the `AUTHOR_MODEL` var; default is
-`@cf/openai/gpt-oss-120b` — line-addressed editing needs a model that reliably
-reads line numbers off the numbered file and emits exact positions, which it does
-(small correct edits in ~2-4s). Weaker instruct/coder models (e.g.
-`@cf/meta/llama-3.3-70b-instruct-fp8-fast`, `@cf/qwen/qwen2.5-coder-32b-instruct`)
-drop the literal or line number being changed and their edits fail to apply;
-cheaper alternatives that still work are `@cf/openai/gpt-oss-20b` and
-`@cf/qwen/qwen3-30b-a3b-fp8`. The stream reader handles both the classic Workers
-AI (`{response}`) and OpenAI-style (`choices[].delta.content`) response schemas.
-Override per-instance with a `.dev.vars` line `AUTHOR_MODEL="..."` locally, or
-`wrangler.jsonc` `vars` for deploys.
+The assistant's model is `CodeAssistant.getModel()` in
+`src/assistant/code-assistant.ts`, set via the `ASSISTANT_MODEL` var. It is
+**pinned to `@cf/zai-org/glm-5.2`** (Z.ai's agentic-coding model) in
+`wrangler.jsonc` `vars`, with a hardcoded fallback of `@cf/openai/gpt-oss-120b`.
+A bare `@cf/...` id hits Workers AI directly through the `AI` binding; a
+`"<provider>/<model>"` slug routes through AI Gateway (see Think's `getModel`
+docs). Unlike the old one-shot editor, the model here must be a reliable
+**tool-caller** (it drives the agentic loop) — weak models may stop early, refuse
+tasks, or emit bad edit ops. Override the pin locally with a `.dev.vars` line
+`ASSISTANT_MODEL="..."` (takes precedence in dev), or edit the `wrangler.jsonc`
+`vars` entry for deploys.
+
+Reasoning models (glm-5.2, gpt-oss) get two guards in `beforeTurn`: a large
+per-step `maxOutputTokens` (so reasoning can't crowd out the tool call and end
+the step with `finishReason:"length"` before an edit is emitted) and a
+`reasoning_effort` (default `medium`, tunable via the `ASSISTANT_REASONING_EFFORT`
+var) — low under-plans and invites lazy refusals, high burns tokens.
 
 ### Add a new resource (e.g. R2 for images)
 
@@ -352,15 +375,42 @@ export function applyAction(state, action, ctx) { // pure reducer
 The client page connects a WebSocket to `/agents/app-host/<room>?token=…` (the
 room read from the page's own `location`, default `main`), sends
 `{type:"action", action}` frames, and renders each `{type:"state"}`
-broadcast (after an initial `{type:"welcome", seat}`). The example
-`tictactoe` app shows the whole pattern end-to-end; `poker` (the default seed)
-adds hidden information on top (see below).
+broadcast (after an initial `{type:"welcome", seat}`). It must also handle the
+reserved `{type:"reload"}` frame by calling `location.reload()` (see
+[Live reload](#live-reload)). The example `tictactoe` app shows the whole pattern
+end-to-end; `poker` (the default seed) adds hidden information on top (see below).
 
-Seats are opaque player slots the coordinator assigns bound to a stable browser
-token: a brief disconnect keeps your seat, and a departed player's seat is only
+Seats are opaque player slots the coordinator assigns bound to a stable player
+`token`: a brief disconnect keeps your seat, and a departed player's seat is only
 reclaimed when another player needs it. **Seat names are declared by the app**
 via the optional `seats` export (the framework core names none); no `seats`
 export means everyone is a spectator (`ctx.seat === null`).
+
+#### Live reload
+
+The realtime channel normally carries only game **state**, so a code change
+(AI edit, manual save, rollback) wouldn't reach clients already running the old
+page. On every successful **promote**, `AppHost` broadcasts a `{type:"reload"}`
+frame to all connected clients; the app page reloads and re-fetches the new
+version. Broadcasts are **debounced** (`RELOAD_DEBOUNCE_MS`, 750 ms) so a
+multi-promote AI turn triggers a single reload on the final good version, and a
+**failed** build (not promoted) never reloads anyone. Realtime app pages opt in
+by handling the frame (the bundled templates do; the assistant's system prompt
+tells AI-authored pages to keep it).
+
+#### Player identity (reconnection)
+
+A player's seat is bound to the `token` on the WebSocket URL, so returning with
+the same token resumes the same seat. `room.html` gives **each tab its own id**
+and writes it into that tab's address bar (`?player=<id>`, via `replaceState`):
+
+- **Multiple tabs** of one browser ⇒ different ids ⇒ **different players**.
+- **Reload / reopen-closed-tab** restores the URL (and id) ⇒ **resumes the seat**.
+- A freshly-typed or **shared** room link has no `player=` ⇒ a new id ⇒ a new
+  player. ("Copy link" intentionally omits `player=`, so invites never clone your
+  seat.)
+- Bundled app pages fall back to a per-browser `localStorage` id when opened
+  directly (no `player=` forwarded), and honor an explicit `?player=` override.
 
 ### Multiplayer (asymmetric views: hidden information)
 
@@ -414,11 +464,14 @@ Realtime state lives in the AppHost's `app_data` table under a reserved
 | `GET /api/files` | — | `{ files: [{ path, content }] }` |
 | `GET /api/versions` | — | `{ versions: [{ id, ts, note }] }` |
 | `POST /api/files` | `{ files, note? }` | `{ version }` |
-| `POST /api/edit` | `{ instruction }` | `{ version }` |
 | `POST /api/reset` | — | `{ version }` |
 | `POST /api/rollback` | `{ version }` | `{ ok: true }` |
 | `ANY /preview/<path>` | — | the app's response (HTML gets `<base>` injected) |
 | `WS /agents/app-host/<room>` | — | realtime channel for multiplayer apps (see Multiplayer) |
+| `WS /agents/code-assistant/<room>` | — | AI coding assistant chat (Agents `cf_agent_chat_*` protocol) |
+
+AI editing has no HTTP route: it is a chat over the `/agents/code-assistant/<room>`
+WebSocket, driven by the `CodeAssistant` (Think) Durable Object.
 
 All `/api/*` and `/preview/*` routes take an optional `?room=<id>` selecting the
 target room (its own Durable Object); the id is the DO name on the `/agents/*`
@@ -437,34 +490,35 @@ version history and realtime state). The default room is `main`.
   live. A broken version is still saved (so you can inspect/fix or roll back to
   it), but it is NOT promoted — the live pointer stays on the last version that
   built, and `status` flips to `error` with the build message in `lastError`.
-- **`max_tokens`** is set high in the author (small defaults truncate code and
-  cause "Unterminated string literal" build errors).
-- **Line-addressed edits.** The author shows the model the current files with
-  line numbers and asks for `@@REPLACE/INSERT/DELETE/CREATE n@@` ops (parsed by
-  `parseEdits`, applied bottom-up by `applyEdits` so original line numbers stay
-  valid). It never rewrites whole files, so edits are small and fast (~2-4s vs
-  the old multi-minute full-file regen) and a slip can't corrupt untouched code.
-  If the model returns whole `===FILE:` blocks instead, the author falls back to
-  those. NOTE: this needs a model that can emit exact positions — see the model
-  gotcha below.
-- **The AI author streams** its response and applies overall + idle timeouts
-  (tune with the `AUTHOR_TIMEOUT_MS` var). Streaming avoids Workers AI's hard
-  "3046 Request timeout" on long generations; a real stall fails with a clear
-  message and the live version is untouched. The reader accepts both the classic
-  Workers AI (`{response}`) and OpenAI-style (`choices[].delta.content`, reasoning
-  tokens ignored) stream schemas.
-- **Self-heal:** when an edit fails to APPLY (an op cited a bad line) or fails to
-  BUILD, the host feeds the exact error back to the model (`CodeAuthor.repair()`)
-  and retries up to `MAX_AI_REPAIRS` times, validating before saving so only the
-  final result becomes a version. Its ceiling is the MODEL: the default
-  `@cf/openai/gpt-oss-120b` reads the numbered file and emits correct line ops;
-  weaker models (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`,
-  `@cf/qwen/qwen2.5-coder-32b-instruct`) drop the very literal or line number
-  being changed — so their edits never apply, and repeating the error doesn't
-  help. Big structural rewrites are still best done as small incremental edits.
+- **The AI assistant is `@cloudflare/think` (EXPERIMENTAL).** It runs as a
+  separate per-room Durable Object (`CodeAssistant`) and drives an agentic loop
+  over host-side tools. It's a heavy dependency (`ai` v6 — NOT v7 — `zod` v4,
+  `@cloudflare/shell`, codemode, just-bash; ~5 MB gzip bundle). We install the
+  minimal set: no React / `@cloudflare/ai-chat` (the Chat panel is vanilla JS),
+  and Think's workspace/bash/code-execution tools are gated off. `Think`'s peer
+  `agents >=0.17.1` is satisfied by the pinned `0.17.3`.
+- **Tool-driven, line-addressed edits.** `apply_line_edits` (the fast path)
+  passes structured ops to `applyEdits` (applied bottom-up so line numbers stay
+  valid; validates bounds/overlap). `read_file` shows 1-indexed line numbers so
+  the model can cite exact positions. Needs a reliable tool-calling model.
+- **Self-heal is the loop.** A write tool returns the build outcome; on failure
+  the model reads the error and makes a follow-up edit — no separate retry loop.
+  Latency: a simple change is ~1 fast tool call; complex changes run several
+  sequential model round-trips (slower than the old one-shot, but far more
+  capable). Weak models may stop early — pick a solid `ASSISTANT_MODEL`.
 - **Rendered vs Raw.** The preview renders HTML in a sandboxed iframe; relative
   URLs work via an injected `<base href="/preview/">`. Absolute app URLs (`/x`)
   will not reach the app — the AI is steered toward relative URLs.
+- **Live reload needs the app page to handle `{type:"reload"}`.** The bundled
+  templates do; a room whose app was seeded before this was added won't reload
+  others until its page includes the handler (use a fresh room, or ask the
+  assistant to add it). Non-realtime apps (e.g. `counter`, no WebSocket) have no
+  channel to receive it — reload them manually.
+- **Player identity is per-tab, in the URL.** `room.html` mints an id and stores
+  it in the address bar (`?player=`). A shared/typed room link has none, so it's
+  a new player; multiple tabs are distinct players; reload/reopen resumes. Old
+  `.wrangler/` rooms may still carry the previous `sessionStorage`/`localStorage`
+  scheme until reseeded.
 - **Local state persists** across `wrangler dev` restarts (Durable Object
   storage in `.wrangler/`), so your versions survive restarts.
 ```
