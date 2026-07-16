@@ -3,6 +3,7 @@ import { counterTemplate } from "./examples/counter";
 import { notesTemplate } from "./examples/notes";
 import { tictactoeTemplate } from "./examples/tictactoe";
 import { pokerTemplate } from "./examples/poker";
+import { blackjackTemplate } from "./examples/blackjack";
 
 /**
  * The app catalog.
@@ -13,6 +14,9 @@ import { pokerTemplate } from "./examples/poker";
  * the framework core never references concrete app content directly.
  */
 export const templates: Record<string, AppTemplate> = {
+  // Multiplayer blackjack vs. a shared dealer (hidden dealer hole card).
+  // See src/templates/examples/blackjack.ts
+  blackjack: blackjackTemplate,
   // Multiplayer + hidden-information example app (asymmetric per-player views).
   // See src/templates/examples/poker.ts
   poker: pokerTemplate,
@@ -28,7 +32,7 @@ export const templates: Record<string, AppTemplate> = {
 // The single hosted app — the ONE source of truth. This framework runs ONE app
 // at a time; change this line ALONE to build a different app on the framework,
 // e.g. "tictactoe" or "counter" (AppHost.initialState.templateId derives from it).
-export const DEFAULT_TEMPLATE_ID = "poker";
+export const DEFAULT_TEMPLATE_ID = "blackjack";
 
 export function getTemplate(id: string | undefined): AppTemplate {
   return templates[id ?? DEFAULT_TEMPLATE_ID] ?? templates[DEFAULT_TEMPLATE_ID];

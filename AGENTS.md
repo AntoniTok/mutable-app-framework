@@ -39,8 +39,9 @@ Object; each request runs the live version in an isolated Dynamic Worker; edits
 - `src/author/*` — the line-edit engine (`parseEdits`/`applyEdits`/`FileEdit`)
   reused by the assistant's `apply_line_edits` tool. `WorkersAiAuthor` (the old
   one-shot `CodeAuthor`) is retained but no longer wired to `AppHost`.
-- `src/templates/types.ts` — the app contract. `examples/poker.ts` (realtime +
-  hidden information), `examples/tictactoe.ts` (realtime), `examples/counter.ts`
+- `src/templates/types.ts` — the app contract. `examples/blackjack.ts` (realtime +
+  hidden information; the DEFAULT seed), `examples/poker.ts` (realtime + hidden
+  information), `examples/tictactoe.ts` (realtime), `examples/counter.ts`
   (HTTP-only) and `examples/notes.ts` (filesystem capability) = example apps.
 - `src/realtime/coordinator.ts` — the realtime engine (WS/presence/seats/
   per-player broadcast) that drives the app's pure `applyAction` reducer and
@@ -173,8 +174,9 @@ loop reading a returned build error and fixing it IS the self-heal (no separate
 repair loop) — the failed-build tool result also tells the model the base
 reverted (not promoted), steering it to re-read or switch to `save_version`.
 Per-room memory is a writable Session context block (`set_context`). Model set via
-`ASSISTANT_MODEL` — **pinned to `@cf/zai-org/glm-5.2`** in `wrangler.jsonc` `vars`
-(hardcoded fallback `@cf/openai/gpt-oss-120b`); it must be a reliable tool-caller.
+`ASSISTANT_MODEL` — **pinned to `@cf/moonshotai/kimi-k2.7-code`** in `wrangler.jsonc`
+`vars` (Moonshot's 1T-param agentic coding model, 262k context; same id is the
+hardcoded fallback); it must be a reliable tool-caller.
 Reasoning models get `beforeTurn` guards: a large `maxOutputTokens` (so reasoning
 can't crowd out the tool call) and `reasoning_effort` (default `medium`, tunable
 via `ASSISTANT_REASONING_EFFORT`). There is no `/api/edit` HTTP route anymore.
@@ -182,14 +184,15 @@ via `ASSISTANT_REASONING_EFFORT`). There is no `/api/edit` HTTP route anymore.
 ## One app at a time
 
 This framework hosts ONE app. The hosted app is chosen by the SINGLE constant
-`DEFAULT_TEMPLATE_ID` in `src/templates/registry.ts` (currently `poker`);
+`DEFAULT_TEMPLATE_ID` in `src/templates/registry.ts` (currently `blackjack`);
 `AppHost.initialState.templateId` derives from it. Every room seeds from it. To
-build a different app, change that one line (e.g. `"tictactoe"` or `"counter"`)
+build a different app, change that one line (e.g. `"poker"` or `"counter"`)
 and/or the template's files. Note: a room already in `.wrangler/` keeps its
 seeded code — use a fresh room id (or clear `.wrangler/`) after switching. The
-four example apps (`poker`, `tictactoe`, `counter`, `notes`) all conform to the
-current contract; `npm run smoke` (see below) checks whichever of the first three
-is live (`notes` has no smoke check — test it by hand).
+five example apps (`blackjack`, `poker`, `tictactoe`, `counter`, `notes`) all
+conform to the current contract; `npm run smoke` (see below) covers `counter`,
+`tictactoe` and `poker` (`blackjack` and `notes` have no smoke check — test them
+by hand).
 
 ## Run / verify
 
@@ -202,7 +205,7 @@ npm run dev                # wrangler dev on :8787
 Smoke test (server must be running):
 ```bash
 curl -s localhost:8787/api/state
-curl -s localhost:8787/preview/            # renders the app page (poker table)
+curl -s localhost:8787/preview/            # renders the app page (blackjack table)
 npm run smoke                              # runtime checks for the LIVE app
 ```
 `npm run smoke` (`scripts/smoke.mjs`, no deps — Node 22+ `fetch`/`WebSocket`)
@@ -214,9 +217,9 @@ per-player `view` hides other hands). To verify ALL three, set
 Multiplayer is over WebSockets, so test it in multiple browser tabs: open the
 lobby at http://localhost:8787, **Create room**, then open that room's URL
 (`/room.html?room=<id>`, or the "Copy link" button) in more tabs — state syncs
-live and each tab is assigned a seat (for `poker`, `P1..P6`; else spectator).
-With the default `poker` app, each tab sees only its OWN hole cards — that's the
-per-player `view` in action. Press **Edit** in a room to reveal the
+live and each tab is assigned a seat (for `blackjack`, `P1..P5`; else spectator).
+With the default `blackjack` app, the dealer's hole card stays hidden until the
+dealer plays — that's the per-player `view` in action. Press **Edit** in a room to reveal the
 Chat/Code/History tools. A second room id stays fully isolated, and bare
 `/preview/` still works as room `main`. To test the AI assistant, press **Edit**,
 type a request in the **Chat** panel, and watch the tool-call chips + the live
@@ -270,8 +273,8 @@ After editing `wrangler.jsonc`, run `npm run types` to regenerate
   outcome (`built`/`status`/`error` + `guidance` on failure); if a build fails the
   model reads the error and makes a follow-up edit. There is no separate
   `MAX_AI_REPAIRS` retry loop. Ceiling is still the MODEL: `ASSISTANT_MODEL` must
-  be a reliable TOOL-CALLER (pinned `@cf/zai-org/glm-5.2`); weak models may stop
-  early, refuse tasks, or emit bad ops.
+  be a reliable TOOL-CALLER (pinned `@cf/moonshotai/kimi-k2.7-code`); weak models
+  may stop early, refuse tasks, or emit bad ops.
 - **Failed builds don't promote — so the base reverts.** `getFiles`/`read_file`
   return the last GOOD version, not a failed attempt. The failed-build tool result
   says so and steers the model to re-read or use `save_version` (whole file);

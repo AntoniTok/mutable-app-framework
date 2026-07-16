@@ -171,8 +171,11 @@ src/
                                (incl. the optional REALTIME CONTRACT).
     registry.ts                The app catalog + the single hosted app switch.
     examples/
-      poker.ts                 EXAMPLE APP (default seed): realtime multiplayer
-                               with HIDDEN INFORMATION (per-player views).
+      blackjack.ts             EXAMPLE APP (default seed): realtime multiplayer
+                               Blackjack 21 vs. a shared dealer, with HIDDEN
+                               INFORMATION (the dealer's hole card).
+      poker.ts                 EXAMPLE APP: realtime multiplayer with HIDDEN
+                               INFORMATION (per-player views).
       tictactoe.ts             EXAMPLE APP: realtime multiplayer (symmetric).
       counter.ts               EXAMPLE APP: simple interactive counter (store).
       notes.ts                 EXAMPLE APP: notes pad backed by the filesystem
@@ -341,18 +344,20 @@ reducer (+ optional `initialState`) — see [Multiplayer](#multiplayer-live-pure
    seeds from it. (A room already in `.wrangler/` keeps its seeded code — use a
    fresh room id, or clear `.wrangler/`, after switching.)
 
-All four bundled example apps (`poker`, `tictactoe`, `counter`, `notes`) conform
-to the current contract and can be hosted this way; `npm run smoke` checks the
-live one for `counter`/`tictactoe`/`poker` (set `DEFAULT_TEMPLATE_ID`, restart
-`npm run dev`, re-run to cover them). `notes` (the filesystem demo) has no smoke
-check yet — test it by hand in the browser.
+All five bundled example apps (`blackjack`, `poker`, `tictactoe`, `counter`,
+`notes`) conform to the current contract and can be hosted this way; `npm run
+smoke` checks the live one for `counter`/`tictactoe`/`poker` (set
+`DEFAULT_TEMPLATE_ID`, restart `npm run dev`, re-run to cover them). `blackjack`
+(the default seed) and `notes` (the filesystem demo) have no smoke check yet —
+test them by hand in the browser.
 
 ### Swap the AI model
 
 The assistant's model is `CodeAssistant.getModel()` in
 `src/assistant/code-assistant.ts`, set via the `ASSISTANT_MODEL` var. It is
-**pinned to `@cf/zai-org/glm-5.2`** (Z.ai's agentic-coding model) in
-`wrangler.jsonc` `vars`, with a hardcoded fallback of `@cf/openai/gpt-oss-120b`.
+**pinned to `@cf/moonshotai/kimi-k2.7-code`** (Moonshot AI's frontier-scale,
+1T-param agentic coding model — 262k context, multi-turn tool calling, structured
+outputs) in `wrangler.jsonc` `vars`, with the same id as the hardcoded fallback.
 A bare `@cf/...` id hits Workers AI directly through the `AI` binding; a
 `"<provider>/<model>"` slug routes through AI Gateway (see Think's `getModel`
 docs). Unlike the old one-shot editor, the model here must be a reliable
@@ -361,7 +366,7 @@ tasks, or emit bad edit ops. Override the pin locally with a `.dev.vars` line
 `ASSISTANT_MODEL="..."` (takes precedence in dev), or edit the `wrangler.jsonc`
 `vars` entry for deploys.
 
-Reasoning models (glm-5.2, gpt-oss) get two guards in `beforeTurn`: a large
+Reasoning models (kimi-k2.7-code, glm, gpt-oss) get two guards in `beforeTurn`: a large
 per-step `maxOutputTokens` (so reasoning can't crowd out the tool call and end
 the step with `finishReason:"length"` before an edit is emitted) and a
 `reasoning_effort` (default `medium`, tunable via the `ASSISTANT_REASONING_EFFORT`
@@ -418,7 +423,8 @@ room read from the page's own `location`, default `main`), sends
 broadcast (after an initial `{type:"welcome", seat}`). It must also handle the
 reserved `{type:"reload"}` frame by calling `location.reload()` (see
 [Live reload](#live-reload)). The example `tictactoe` app shows the whole pattern
-end-to-end; `poker` (the default seed) adds hidden information on top (see below).
+end-to-end; `blackjack` (the default seed) and `poker` add hidden information on
+top (see below).
 
 Seats are opaque player slots the coordinator assigns bound to a stable player
 `token`: a brief disconnect keeps your seat, and a departed player's seat is only
@@ -471,8 +477,10 @@ The coordinator projects the state **per connection** (batched into one
 sandboxed call via `runner.project()`) and sends each client its own
 `{type:"state"}` frame — so secret data never leaves the server. Absent a `view`
 export, the full state is broadcast to everyone (symmetric apps like tic-tac-toe
-are unchanged). The `poker` example (the default seed) demonstrates the whole
-pattern: each player sees only their own hole cards until showdown.
+are unchanged). The `blackjack` example (the default seed) demonstrates the
+pattern: the dealer's hole card stays hidden from everyone until the dealer plays.
+The `poker` example goes further — each player sees only their own hole cards
+until showdown.
 
 > Concurrency: the coordinator **serializes** state transitions (a promise
 > chain), so two players acting at the same instant can't race and clobber each

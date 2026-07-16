@@ -34,9 +34,11 @@
   "ai": { "binding": "AI" },
 
   // Model for the Think-based coding assistant. Must be a reliable tool-caller;
-  // glm-5.2 is an agentic-coding model. Overridable locally via .dev.vars.
+  // kimi-k2.7-code is a frontier-scale (1T-param) agentic coding model with a
+  // 262k context window, multi-turn tool calling and structured outputs — the
+  // strongest Workers-AI-hosted model for this loop. Overridable via .dev.vars.
   "vars": {
-    "ASSISTANT_MODEL": "@cf/zai-org/glm-5.2"
+    "ASSISTANT_MODEL": "@cf/moonshotai/kimi-k2.7-code"
   },
 
   // Workers Logs. `head_sampling_rate: 1` captures every invocation so the

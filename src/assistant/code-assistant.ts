@@ -1,8 +1,8 @@
 import { Think, Session } from "@cloudflare/think";
-import type { TurnContext, TurnConfig } from "@cloudflare/think";
+import type { TurnContext, TurnConfig, PrepareStepContext, StepConfig, MediaEvictionConfig } from "@cloudflare/think";
 import { getAgentByName } from "agents";
 import { tool } from "ai";
-import type { ToolSet } from "ai";
+import type { ToolSet, ModelMessage } from "ai";
 import { z } from "zod";
 import type { Env } from "../types";
 import type { AppHost } from "../agent/app-host";
@@ -27,22 +27,58 @@ import { applyEdits, type FileEdit } from "../author/workers-ai-author";
  */
 
 // Default assistant model. Must be a reliable TOOL-CALLER (distinct concern
-// from the line-edit author's AUTHOR_MODEL). gpt-oss-120b is OpenAI-style and
-// tool-capable; override per-instance with the ASSISTANT_MODEL var.
-const DEFAULT_ASSISTANT_MODEL = "@cf/openai/gpt-oss-120b";
+// from the line-edit author's AUTHOR_MODEL). kimi-k2.7-code is a frontier-scale
+// (1T-param) agentic coding model with a 262k context window, multi-turn tool
+// calling and structured outputs — the strongest Workers-AI-hosted pick for this
+// loop. Override per-instance with the ASSISTANT_MODEL var (see wrangler.jsonc).
+const DEFAULT_ASSISTANT_MODEL = "@cf/moonshotai/kimi-k2.7-code";
 
-/** Cap on tool-call rounds per turn (bounds worst-case latency + cost). */
-const MAX_STEPS = 12;
+// Cap on tool-call rounds per turn (bounds worst-case latency + cost). A large
+// feature (e.g. "add split") legitimately needs many read/edit/preview rounds,
+// so we give the model real room; kimi's 262k context comfortably holds the
+// resulting transcript. This is a CEILING, not the typical turn — small tweaks
+// still finish in 2-4 rounds. Raise if big features get cut off mid-work.
+const MAX_STEPS = 20;
 
-// gpt-oss is a REASONING model: left unbounded it spends the whole per-step
+// kimi-k2.7-code is a REASONING model: left unbounded it spends the whole per-step
 // output budget on reasoning tokens and the step ends with finishReason:"length"
 // BEFORE it ever emits the tool call (the turn appears to "do nothing"). The fix
-// is a LARGE per-step output budget so reasoning never crowds out the tool call.
-// With that headroom we keep reasoning at "medium" (not "low"): too little
-// reasoning makes the model punt on harder tasks with lazy "I can't do that"
-// refusals instead of reading the files and editing. Tunable via env.
-const MAX_OUTPUT_TOKENS = 16000;
+// is a LARGE per-step output budget so reasoning never crowds out the tool call —
+// and so a save_version can emit a whole file without being truncated mid-string
+// (which would surface as a build/JSON error). With that headroom we keep
+// reasoning at "medium" (not "low"): too little reasoning makes the model punt on
+// harder tasks with lazy "I can't do that" refusals instead of reading the files
+// and editing. Tunable via env.
+const MAX_OUTPUT_TOKENS = 32000;
 const DEFAULT_REASONING_EFFORT = "medium";
+
+// The assistant keeps its ENTIRE conversation in a Session and replays it every
+// turn. A tool-heavy task (esp. read_file / save_version, which carry whole
+// files) balloons that transcript; once the model-facing context gets large the
+// model call slows to a crawl or stalls before emitting a tool call, so the turn
+// appears to "do nothing" — and since history only grows, EVERY later turn fails
+// the same way (the exact failure mode reported). Two bounds keep it in check:
+//
+//   1. READ-TIME TRUNCATION (beforeStep): before each model step, big tool
+//      outputs / tool-call inputs / long text in OLDER messages are clipped to a
+//      marker. The recent window stays verbatim so the model can still act on the
+//      latest file read/edit. Deterministic — no model call, never a no-op. This
+//      is the primary fix and repairs already-bloated rooms immediately.
+//   2. MEDIA EVICTION (stored): large strings inside aged tool outputs are
+//      evicted from durable storage too, so the boot/hydration footprint doesn't
+//      grow without bound (guards SQLITE_NOMEM on long-lived rooms).
+//
+// Messages at the tail kept fully intact (both for read-time truncation and
+// media eviction). At least the last few carry the current file contents the
+// model needs to edit. These were tuned tight for glm-5.2 (which stalled on
+// bloat); kimi's 262k-token window lets us keep a much larger verbatim window so
+// the model retains full context across a long multi-step feature — the bounds
+// now guard only against pathological, unbounded growth, not normal work.
+const KEEP_RECENT_MESSAGES = 14;
+// In OLDER messages, clip any single text/tool payload longer than this (chars).
+const OLD_MSG_MAX_CHARS = 3000;
+// Evict stored tool-output/text parts larger than this (bytes) from old messages.
+const EVICT_PART_BYTES = 16000;
 
 // The names of the tools this assistant exposes. `beforeTurn` restricts the
 // model to THESE (plus the Session memory tool) so the built-in workspace
@@ -84,17 +120,97 @@ THE APP CONTRACT (code you write MUST follow this):
 
 HOW TO EDIT (choose the cheapest tool that fits):
 - For a SMALL, localized change, call read_file to see current line numbers, then apply_line_edits ONCE and stop. This is the fast path — prefer it for small tweaks.
-- For a brand-new file, a large/structural change, or ANYTHING touching layout/CSS/how the UI is assembled, use save_version with the COMPLETE file. Line surgery on structural changes drifts and corrupts — send the whole file instead.
+- PREFER apply_line_edits even for most larger changes: make a series of targeted edits (read_file between them), not one giant rewrite. save_version requires you to re-emit the ENTIRE file as one tool argument; for a big or quote-heavy file that payload is large and easily malformed/truncated (a "JSON error passing the string"), so reserve save_version for a brand-new file or a near-total rewrite of a SMALL file. When in doubt, edit in place with apply_line_edits.
 - Never fire multiple apply_line_edits in a row without a read_file in between: after any edit the line numbers move, so blind stacked edits land on the wrong lines.
 - After a risky change, call preview to verify the rendered output, then fix if needed.
+
+EDITING THE HTML PAGE — READ THIS (this is where edits break most):
+- Because the app source uses no backticks, the HTML page is usually built as an ARRAY OF SINGLE-QUOTED STRINGS joined together, e.g. var PAGE = [ '<div>', '<p>hi</p>', '</div>' ].join(''). read_file shows each HTML/JS line as its own '...' array element ending in a comma.
+- To edit that page you edit ARRAY ELEMENTS, not raw HTML. Every line you insert or replace MUST be a complete single-quoted JS string ending in a comma, e.g. insert  '  <button id="splitBtn">Split</button>',  — NOT a bare <button> line. A line that isn't a valid quoted element (missing quote, missing trailing comma, an inner ' that isn't escaped) breaks the array literal and the build fails with "Expected ]".
+- Use double quotes for HTML attributes inside the single-quoted string (class="x"), so you never need to escape quotes. To add several lines, insert several complete '...' element lines.
+- The client behaviour lives in the '<script>' … '</' + 'script>' elements of that same array — same rule: each line stays a self-contained quoted string.
 
 BUILD FAILURES (read carefully — this is the #1 way edits go wrong):
 - A save is PROMOTED live only if it BUILDS. A version that fails to build is SAVED but DISCARDED — it does NOT become the base. The live app stays on the last good version, and read_file then returns THAT version, not your failed attempt.
 - So after a build error: your changes are GONE. Do NOT compute a follow-up edit from the line numbers of your failed attempt — they no longer exist. Call read_file to see the CURRENT (last-good) file, then fix the exact error.
-- If a build fails TWICE, stop using apply_line_edits and switch to save_version with the complete corrected file. Do not keep stacking line edits.
+- If a build fails, read the error, call read_file to see the CURRENT last-good file, and make ONE corrected apply_line_edits. If it fails a SECOND time on the same spot, re-read that exact region and fix the specific syntax the error names (usually a broken quoted array element — an unbalanced quote/bracket or a missing trailing comma). Only fall back to save_version if the file is small; for a large file, keep fixing in place with targeted line edits rather than re-emitting the whole file.
 - Use list_versions / rollback to inspect or revert history; reset_app re-seeds from the template.
 
 Keep replies short. Do the work with tools; report what changed (and the resulting version) briefly.`;
+
+/** Clip a long string to `max` chars with a marker telling the model to re-read. */
+function clip(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}\n…[truncated ${s.length - max} chars of stale context — call read_file for the current file if you need it]`;
+}
+
+/**
+ * Truncate bulky payloads inside ONE model message (in place on a shallow copy).
+ * Clips long text/reasoning and big tool-call inputs / tool-result outputs — the
+ * whole-file blobs that dominate the transcript. Unknown shapes pass through.
+ */
+function truncateModelMessage(msg: ModelMessage, max: number): ModelMessage {
+  const content: unknown = (msg as { content: unknown }).content;
+  if (typeof content === "string") {
+    return { ...msg, content: clip(content, max) } as ModelMessage;
+  }
+  if (!Array.isArray(content)) return msg;
+  const parts = content.map((part) => {
+    const p = part as Record<string, unknown>;
+    const type = p.type;
+    if ((type === "text" || type === "reasoning") && typeof p.text === "string") {
+      return { ...p, text: clip(p.text, max) };
+    }
+    // Tool CALL input (e.g. save_version's full file body) in an old message.
+    if (type === "tool-call" && p.input !== undefined) {
+      const s = safeStringify(p.input);
+      if (s.length > max) return { ...p, input: { truncated: true, note: clip(s, max) } };
+      return p;
+    }
+    // Tool RESULT output (e.g. read_file's numbered file) in an old message.
+    if (type === "tool-result" && p.output !== undefined) {
+      return { ...p, output: truncateToolOutput(p.output, max) };
+    }
+    return p;
+  });
+  return { ...msg, content: parts } as ModelMessage;
+}
+
+/** AI SDK tool-result output is a tagged union; clip its text/json payload. */
+function truncateToolOutput(output: unknown, max: number): unknown {
+  const o = output as Record<string, unknown>;
+  if (o && typeof o === "object" && typeof o.type === "string") {
+    if ((o.type === "text" || o.type === "error-text") && typeof o.value === "string") {
+      return { ...o, value: clip(o.value, max) };
+    }
+    if ((o.type === "json" || o.type === "error-json") && o.value !== undefined) {
+      const s = safeStringify(o.value);
+      if (s.length > max) return { type: "text", value: clip(s, max) };
+      return o;
+    }
+  }
+  const s = safeStringify(output);
+  return s.length > max ? { type: "text", value: clip(s, max) } : output;
+}
+
+function safeStringify(v: unknown): string {
+  try {
+    return typeof v === "string" ? v : JSON.stringify(v) ?? "";
+  } catch {
+    return String(v);
+  }
+}
+
+/**
+ * Bound the model-facing context: keep the last `keepRecent` messages verbatim
+ * (the model needs current file contents to edit), and clip bulky stale payloads
+ * in everything older. Applied before each step so context stays flat no matter
+ * how long/tool-heavy the session got.
+ */
+function boundContext(messages: ModelMessage[], keepRecent = KEEP_RECENT_MESSAGES, max = OLD_MSG_MAX_CHARS): ModelMessage[] {
+  const cut = Math.max(0, messages.length - keepRecent);
+  return messages.map((m, i) => (i >= cut ? m : truncateModelMessage(m, max)));
+}
 
 /** Split file content into addressable lines (a single trailing newline is a terminator). */
 function contentLines(content: string): string[] {
@@ -102,11 +218,22 @@ function contentLines(content: string): string[] {
   return body.split("\n");
 }
 
-/** Render one file with 1-indexed line numbers so the model can cite exact positions. */
-function numbered(file: AppFile): string {
+/**
+ * Render a file with 1-indexed line numbers so the model can cite exact
+ * positions. An optional [from, to] window (1-indexed, inclusive) returns only
+ * that slice while keeping the true line numbers, so a large file can be read
+ * in pieces without bloating the transcript.
+ */
+function numbered(file: AppFile, from = 1, to?: number): string {
   const lines = contentLines(file.content);
   const width = String(lines.length).length;
-  return lines.map((l, i) => `${String(i + 1).padStart(width, " ")}| ${l}`).join("\n");
+  const start = Math.max(1, from);
+  const end = Math.min(to ?? lines.length, lines.length);
+  const out: string[] = [];
+  for (let i = start; i <= end; i++) {
+    out.push(`${String(i).padStart(width, " ")}| ${lines[i - 1]}`);
+  }
+  return out.join("\n");
 }
 
 export class CodeAssistant extends Think<Env> {
@@ -119,6 +246,16 @@ export class CodeAssistant extends Think<Env> {
   // Don't stream reasoning tokens to the client — the vanilla chat UI ignores
   // them, and this keeps the wire clean.
   sendReasoning = false;
+
+  // Bound the persisted footprint too: large strings inside aged tool outputs
+  // are evicted from durable storage (kept only for the recent window), so a
+  // long-lived room's hydration cost doesn't grow without bound. Read-time
+  // truncation (beforeStep) handles the model-facing context; this handles disk.
+  override mediaEviction: MediaEvictionConfig = {
+    keepRecentMessages: KEEP_RECENT_MESSAGES,
+    minPartBytes: EVICT_PART_BYTES,
+    externalizeToWorkspace: false
+  };
 
   getModel(): string {
     return this.env.ASSISTANT_MODEL || DEFAULT_ASSISTANT_MODEL;
@@ -160,6 +297,23 @@ export class CodeAssistant extends Think<Env> {
         }
       }
     };
+  }
+
+  /**
+   * Runs before EVERY model step (including the first). Clip bulky stale
+   * payloads in older messages so the model-facing context stays flat no matter
+   * how long or tool-heavy the session became — the fix for turns that stalled
+   * once the replayed transcript (full-file read_file/save_version blobs) grew
+   * large. The recent window is left verbatim so the model still sees the
+   * current file to edit. Deterministic and cheap (string slicing, no model
+   * call), so it can never no-op the way summary compaction did.
+   */
+  beforeStep(ctx: PrepareStepContext): StepConfig | void {
+    const messages = (ctx as unknown as { messages?: ModelMessage[] }).messages;
+    if (!Array.isArray(messages) || messages.length <= KEEP_RECENT_MESSAGES) return;
+    // `messages` is a valid per-step override (AI SDK PrepareStepResult); cast
+    // past a minor type-version skew between Think's bundled `ai` and ours.
+    return { messages: boundContext(messages) } as unknown as StepConfig;
   }
 
   /** RPC stub for this room's AppHost (same room id => this.name). */
@@ -227,15 +381,39 @@ export class CodeAssistant extends Think<Env> {
 
       read_file: tool({
         description:
-          "Read one live file's contents, shown with 1-indexed line numbers. Use the line numbers to build apply_line_edits ops.",
-        inputSchema: z.object({ path: z.string().describe("File path, e.g. src/index.js") }),
-        execute: async ({ path }) => {
+          "Read one live file's contents, shown with 1-indexed line numbers. Use the line numbers to build apply_line_edits ops. For a LARGE file, read only the slice you need by passing startLine/endLine (omit both to read the whole file) — this keeps the conversation small so long sessions don't stall.",
+        inputSchema: z.object({
+          path: z.string().describe("File path, e.g. src/index.js"),
+          startLine: z
+            .number()
+            .int()
+            .optional()
+            .describe("1-indexed first line to return (inclusive). Omit to start at line 1."),
+          endLine: z
+            .number()
+            .int()
+            .optional()
+            .describe("1-indexed last line to return (inclusive). Omit to read to end of file.")
+        }),
+        execute: async ({ path, startLine, endLine }) => {
           const files = await (await this.#host()).getFiles();
           const file = files.find((f) => f.path === path);
           if (!file) {
             return { error: `No such file: ${path}. Available: ${files.map((f) => f.path).join(", ")}` };
           }
-          return { path, lines: contentLines(file.content).length, content: numbered(file) };
+          const total = contentLines(file.content).length;
+          const from = startLine && startLine > 0 ? startLine : 1;
+          const to = endLine && endLine > 0 ? Math.min(endLine, total) : total;
+          if (from > total) {
+            return { path, lines: total, error: `startLine ${from} is past end of file (${total} lines).` };
+          }
+          const windowed = from > 1 || to < total;
+          return {
+            path,
+            lines: total,
+            ...(windowed ? { range: { startLine: from, endLine: to } } : {}),
+            content: numbered(file, from, to)
+          };
         }
       }),
 
