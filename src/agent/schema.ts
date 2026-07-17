@@ -87,6 +87,34 @@ export function listVersions(agent: SqlAgent): VersionRow[] {
     SELECT id, ts, note FROM versions ORDER BY id DESC`;
 }
 
+/**
+ * Prune old versions so history can't grow without bound (every AI/manual edit
+ * inserts a version + its file rows, forever). Keeps the newest `keep` versions
+ * PLUS the currently-active one (which may be older than the newest `keep` after
+ * a rollback), and deletes the rest along with their `files` rows.
+ *
+ * Tradeoff: rollback can only reach a version that still exists, so `keep` is the
+ * effective depth of the undo history. Returns how many versions were removed.
+ */
+export function pruneVersions(
+  agent: SqlAgent,
+  keep: number,
+  activeVersion: number
+): number {
+  const recent = agent.sql<{ id: number }>`
+    SELECT id FROM versions ORDER BY id DESC LIMIT ${Math.max(1, keep)}`;
+  const keepIds = new Set<number>(recent.map((r) => r.id));
+  keepIds.add(activeVersion);
+
+  const all = agent.sql<{ id: number }>`SELECT id FROM versions`;
+  const doomed = all.map((r) => r.id).filter((id) => !keepIds.has(id));
+  for (const id of doomed) {
+    agent.sql`DELETE FROM files WHERE version = ${id}`;
+    agent.sql`DELETE FROM versions WHERE id = ${id}`;
+  }
+  return doomed.length;
+}
+
 // ── app_data (now only the realtime coordinator's __room__ state; the app's
 //    own store/filesystem moved to the AppStorageFacet) ──
 

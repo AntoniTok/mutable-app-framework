@@ -1,9 +1,20 @@
-import { Think, Session } from "@cloudflare/think";
-import type { TurnContext, TurnConfig, PrepareStepContext, StepConfig, MediaEvictionConfig } from "@cloudflare/think";
+import { Think, Session, defaultContextOverflowClassifier } from "@cloudflare/think";
+import type {
+  TurnContext,
+  TurnConfig,
+  MediaEvictionConfig,
+  ContextOverflowConfig,
+  ChatRecoveryConfig,
+  ChatErrorClassification,
+  ChatErrorContext
+} from "@cloudflare/think";
 import { getAgentByName } from "agents";
+import { createCompactFunction } from "agents/experimental/memory/utils";
 import { tool } from "ai";
-import type { ToolSet, ModelMessage } from "ai";
+import type { ToolSet } from "ai";
 import { z } from "zod";
+import { createCodeTool, aiTools } from "@cloudflare/codemode/ai";
+import { DynamicWorkerExecutor } from "@cloudflare/codemode";
 import type { Env } from "../types";
 import type { AppHost } from "../agent/app-host";
 import type { AppFile } from "../templates/types";
@@ -57,28 +68,40 @@ const DEFAULT_REASONING_EFFORT = "medium";
 // files) balloons that transcript; once the model-facing context gets large the
 // model call slows to a crawl or stalls before emitting a tool call, so the turn
 // appears to "do nothing" — and since history only grows, EVERY later turn fails
-// the same way (the exact failure mode reported). Two bounds keep it in check:
+// the same way. We used to hand-roll a per-step truncation pass (a private
+// `beforeStep` that clipped bulky payloads in older messages). Think ships that
+// capability first-class, so we now use ITS machinery instead of duplicating it:
 //
-//   1. READ-TIME TRUNCATION (beforeStep): before each model step, big tool
-//      outputs / tool-call inputs / long text in OLDER messages are clipped to a
-//      marker. The recent window stays verbatim so the model can still act on the
-//      latest file read/edit. Deterministic — no model call, never a no-op. This
-//      is the primary fix and repairs already-bloated rooms immediately.
-//   2. MEDIA EVICTION (stored): large strings inside aged tool outputs are
-//      evicted from durable storage too, so the boot/hydration footprint doesn't
-//      grow without bound (guards SQLITE_NOMEM on long-lived rooms).
-//
-// Messages at the tail kept fully intact (both for read-time truncation and
-// media eviction). At least the last few carry the current file contents the
-// model needs to edit. These were tuned tight for glm-5.2 (which stalled on
-// bloat); kimi's 262k-token window lets us keep a much larger verbatim window so
-// the model retains full context across a long multi-step feature — the bounds
-// now guard only against pathological, unbounded growth, not normal work.
+//   1. COMPACTION (configureSession): when the estimated transcript crosses
+//      CONTEXT_TOKEN_BUDGET, Think compacts older messages into a summary overlay
+//      (protecting a head + a recent tail, and keeping tool call/result pairs
+//      intact). We register a DETERMINISTIC summarizer (no model call, never a
+//      no-op) so the behaviour matches our old "cheap + reliable" clipping — the
+//      elided middle is replaced by a marker telling the model to re-read files.
+//   2. CONTEXT-OVERFLOW GUARDS (this.contextOverflow): a proactive guard compacts
+//      in place before a step is predicted to overflow the window, and a reactive
+//      backstop compacts + retries a turn that DID overflow — so a genuine
+//      overflow surfaces as a recovered turn, not a silent stall.
+//   3. MEDIA EVICTION (this.mediaEviction): large strings inside aged tool
+//      outputs are evicted from durable storage too, so the boot/hydration
+//      footprint doesn't grow without bound (guards SQLITE_NOMEM on long rooms).
+//   4. CHAT RECOVERY (this.chatRecovery): turns are wrapped in a durable fiber so
+//      a deploy / DO eviction / stream stall mid-turn is resumed, not lost.
+
+// Recent messages kept fully intact by media eviction (compaction has its own
+// head/tail protection). At least the last few carry the current file contents.
 const KEEP_RECENT_MESSAGES = 14;
-// In OLDER messages, clip any single text/tool payload longer than this (chars).
-const OLD_MSG_MAX_CHARS = 3000;
 // Evict stored tool-output/text parts larger than this (bytes) from old messages.
 const EVICT_PART_BYTES = 16000;
+// Compact the transcript once its estimated size crosses this many tokens. kimi's
+// window is 262k; we compact well before that so a long multi-step feature never
+// crowds the model. Also the proactive context-overflow threshold.
+const CONTEXT_TOKEN_BUDGET = 120_000;
+// Deterministic replacement for the elided middle of a compacted transcript. No
+// model call (so compaction is cheap and can never no-op); the app's files are
+// always re-readable, and the prompt already steers the model to re-read.
+const COMPACTION_SUMMARY =
+  "[Earlier conversation was compacted to save context. File contents and history shown earlier may be stale — call read_file / list_files / list_versions / get_state to re-fetch anything you need before editing; do not rely on remembered file contents.]";
 
 // The names of the tools this assistant exposes. `beforeTurn` restricts the
 // model to THESE (plus the Session memory tool) so the built-in workspace
@@ -93,8 +116,42 @@ const TOOL_NAMES = [
   "list_versions",
   "rollback",
   "reset_app",
+  "get_state",
+  // Code Mode: the model writes ONE orchestration script that calls the
+  // read/edit tools below, run in an isolated Dynamic Worker (no egress, no
+  // bindings). See getTools() and invariant #11 in AGENTS.md.
+  "code_mode"
+] as const;
+
+// The tools exposed INSIDE the Code Mode sandbox. Deliberately the read/edit
+// loop only — NOT rollback/reset_app (destructive; better as explicit single
+// top-level calls) and NOT code_mode itself (no recursion). Every one of these
+// still routes writes through AppHost.setFiles's build-gate, so orchestrating
+// them from a script changes only HOW MANY model round-trips it takes, never
+// the promote path or the isolation boundary.
+const CODE_MODE_SANDBOX_TOOLS = [
+  "list_files",
+  "read_file",
+  "apply_line_edits",
+  "save_version",
+  "preview",
+  "list_versions",
   "get_state"
 ] as const;
+
+// Description for the code_mode tool. `{{types}}` is replaced by codemode with
+// the TypeScript signatures generated from CODE_MODE_SANDBOX_TOOLS.
+const CODE_MODE_DESCRIPTION = `Run ONE async arrow function that orchestrates several editing tools in a single step, instead of many separate tool calls. Best for MECHANICAL multi-step work: read a few files, apply a batch of edits, then preview — all at once.
+
+Available inside the sandbox (call as codemode.<name>(...)):
+{{types}}
+
+Rules:
+- Write a plain JavaScript async arrow function body; no TypeScript, no named functions.
+- There is NO model reasoning inside the sandbox and NO network access — it runs isolated. Use it for deterministic sequences, not for anything needing you to "think" between steps.
+- Each codemode.save_version / codemode.apply_line_edits returns the build outcome ({ built, live, status, error }). Read it and branch: if built is false, the version was NOT promoted, so re-read the current file (codemode.read_file) before trying again — do not compute new edits from a failed attempt's line numbers.
+- For a large or quote-heavy file, prefer reading it, building the corrected WHOLE file as a string in JS, and calling codemode.save_version once — this avoids the stacked-line-edit fragility.
+- Return a small summary object (e.g. { version, built }) so you can report what changed.`;
 
 // Session-generated tools we allow through (writable "memory" block => set_context).
 const SESSION_TOOL_NAMES = ["set_context"];
@@ -122,6 +179,7 @@ HOW TO EDIT (choose the cheapest tool that fits):
 - For a SMALL, localized change, call read_file to see current line numbers, then apply_line_edits ONCE and stop. This is the fast path — prefer it for small tweaks.
 - PREFER apply_line_edits even for most larger changes: make a series of targeted edits (read_file between them), not one giant rewrite. save_version requires you to re-emit the ENTIRE file as one tool argument; for a big or quote-heavy file that payload is large and easily malformed/truncated (a "JSON error passing the string"), so reserve save_version for a brand-new file or a near-total rewrite of a SMALL file. When in doubt, edit in place with apply_line_edits.
 - Never fire multiple apply_line_edits in a row without a read_file in between: after any edit the line numbers move, so blind stacked edits land on the wrong lines.
+- For MECHANICAL multi-step work — reading several files, applying a known batch of edits, then previewing — use code_mode: write ONE async arrow function that calls codemode.read_file / codemode.apply_line_edits / codemode.save_version / codemode.preview in sequence and returns a short summary. It runs the whole sequence in a single step (fewer round-trips) and can re-read a file inside the script to keep line numbers fresh. It runs ISOLATED with no network and cannot reason between steps, so use it for deterministic sequences, not for changes where you need to inspect output and decide what to do next — do those with the individual tools.
 - After a risky change, call preview to verify the rendered output, then fix if needed.
 
 EDITING THE HTML PAGE — READ THIS (this is where edits break most):
@@ -137,80 +195,6 @@ BUILD FAILURES (read carefully — this is the #1 way edits go wrong):
 - Use list_versions / rollback to inspect or revert history; reset_app re-seeds from the template.
 
 Keep replies short. Do the work with tools; report what changed (and the resulting version) briefly.`;
-
-/** Clip a long string to `max` chars with a marker telling the model to re-read. */
-function clip(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return `${s.slice(0, max)}\n…[truncated ${s.length - max} chars of stale context — call read_file for the current file if you need it]`;
-}
-
-/**
- * Truncate bulky payloads inside ONE model message (in place on a shallow copy).
- * Clips long text/reasoning and big tool-call inputs / tool-result outputs — the
- * whole-file blobs that dominate the transcript. Unknown shapes pass through.
- */
-function truncateModelMessage(msg: ModelMessage, max: number): ModelMessage {
-  const content: unknown = (msg as { content: unknown }).content;
-  if (typeof content === "string") {
-    return { ...msg, content: clip(content, max) } as ModelMessage;
-  }
-  if (!Array.isArray(content)) return msg;
-  const parts = content.map((part) => {
-    const p = part as Record<string, unknown>;
-    const type = p.type;
-    if ((type === "text" || type === "reasoning") && typeof p.text === "string") {
-      return { ...p, text: clip(p.text, max) };
-    }
-    // Tool CALL input (e.g. save_version's full file body) in an old message.
-    if (type === "tool-call" && p.input !== undefined) {
-      const s = safeStringify(p.input);
-      if (s.length > max) return { ...p, input: { truncated: true, note: clip(s, max) } };
-      return p;
-    }
-    // Tool RESULT output (e.g. read_file's numbered file) in an old message.
-    if (type === "tool-result" && p.output !== undefined) {
-      return { ...p, output: truncateToolOutput(p.output, max) };
-    }
-    return p;
-  });
-  return { ...msg, content: parts } as ModelMessage;
-}
-
-/** AI SDK tool-result output is a tagged union; clip its text/json payload. */
-function truncateToolOutput(output: unknown, max: number): unknown {
-  const o = output as Record<string, unknown>;
-  if (o && typeof o === "object" && typeof o.type === "string") {
-    if ((o.type === "text" || o.type === "error-text") && typeof o.value === "string") {
-      return { ...o, value: clip(o.value, max) };
-    }
-    if ((o.type === "json" || o.type === "error-json") && o.value !== undefined) {
-      const s = safeStringify(o.value);
-      if (s.length > max) return { type: "text", value: clip(s, max) };
-      return o;
-    }
-  }
-  const s = safeStringify(output);
-  return s.length > max ? { type: "text", value: clip(s, max) } : output;
-}
-
-function safeStringify(v: unknown): string {
-  try {
-    return typeof v === "string" ? v : JSON.stringify(v) ?? "";
-  } catch {
-    return String(v);
-  }
-}
-
-/**
- * Bound the model-facing context: keep the last `keepRecent` messages verbatim
- * (the model needs current file contents to edit), and clip bulky stale payloads
- * in everything older. Applied before each step so context stays flat no matter
- * how long/tool-heavy the session got.
- */
-function boundContext(messages: ModelMessage[], keepRecent = KEEP_RECENT_MESSAGES, max = OLD_MSG_MAX_CHARS): ModelMessage[] {
-  const cut = Math.max(0, messages.length - keepRecent);
-  return messages.map((m, i) => (i >= cut ? m : truncateModelMessage(m, max)));
-}
 
 /** Split file content into addressable lines (a single trailing newline is a terminator). */
 function contentLines(content: string): string[] {
@@ -247,14 +231,44 @@ export class CodeAssistant extends Think<Env> {
   // them, and this keeps the wire clean.
   sendReasoning = false;
 
-  // Bound the persisted footprint too: large strings inside aged tool outputs
-  // are evicted from durable storage (kept only for the recent window), so a
-  // long-lived room's hydration cost doesn't grow without bound. Read-time
-  // truncation (beforeStep) handles the model-facing context; this handles disk.
+  // Bound the persisted footprint: large strings inside aged tool outputs are
+  // evicted from durable storage (kept only for the recent window), so a
+  // long-lived room's hydration cost doesn't grow without bound. Compaction
+  // (configureSession) handles the model-facing context; this handles disk.
   override mediaEviction: MediaEvictionConfig = {
     keepRecentMessages: KEEP_RECENT_MESSAGES,
     minPartBytes: EVICT_PART_BYTES,
     externalizeToWorkspace: false
+  };
+
+  // Context-window overflow guards (Think built-ins, replacing the old
+  // hand-rolled per-step clipping). Proactive: compact in place before a step is
+  // predicted to cross the budget. Reactive: if a turn overflows anyway, compact
+  // + retry once rather than surfacing a silent stall. Both call session.compact()
+  // — see the deterministic compaction registered in configureSession.
+  override contextOverflow: ContextOverflowConfig = {
+    reactive: true,
+    maxRetries: 1,
+    proactive: { maxInputTokens: CONTEXT_TOKEN_BUDGET }
+  };
+
+  // Map raw provider errors to a provider-agnostic category so contextOverflow's
+  // reactive backstop knows an overflow when it sees one. The bundled classifier
+  // covers the common providers (incl. Workers AI).
+  override classifyChatError(
+    error: unknown,
+    _ctx?: ChatErrorContext
+  ): ChatErrorClassification | void {
+    return defaultContextOverflowClassifier(error);
+  }
+
+  // Durable turn recovery: wrap each turn in a fiber so a deploy, DO eviction, or
+  // stream stall mid-turn is resumed (or terminalized cleanly) instead of leaving
+  // the client spinning. Assigned as a class field (NOT in onStart) as required.
+  override chatRecovery: ChatRecoveryConfig = {
+    maxAttempts: 6,
+    terminalMessage:
+      "The assistant was interrupted and couldn't finish that turn. Please try again."
   };
 
   getModel(): string {
@@ -269,6 +283,15 @@ export class CodeAssistant extends Think<Env> {
    * One writable "memory" block per room, so the model can persist durable
    * facts about this app across turns/sessions (e.g. "uses poker seats P1-P6").
    * Conversation history + FTS5 search come for free from the Session store.
+   *
+   * Also registers DETERMINISTIC compaction: when the estimated transcript
+   * crosses CONTEXT_TOKEN_BUDGET, Think's reference algorithm protects a head +
+   * recent tail (keeping tool call/result pairs intact) and replaces the middle
+   * with COMPACTION_SUMMARY. We pass a `summarize` that returns that fixed marker
+   * instead of calling a model, so compaction stays cheap and can never no-op —
+   * the app's files are always re-readable, which the system prompt relies on.
+   * This (plus contextOverflow + mediaEviction) is what replaced the old
+   * per-step `beforeStep` clipping.
    */
   configureSession(session: Session): Session {
     return session
@@ -277,6 +300,12 @@ export class CodeAssistant extends Think<Env> {
           "Durable facts about THIS room's app: what it does, its endpoints, storage namespaces, seats/views, and user preferences. Update as you learn.",
         maxTokens: 2000
       })
+      .onCompaction(
+        createCompactFunction({
+          summarize: async () => COMPACTION_SUMMARY
+        })
+      )
+      .compactAfter(CONTEXT_TOKEN_BUDGET)
       .withCachedPrompt();
   }
 
@@ -297,23 +326,6 @@ export class CodeAssistant extends Think<Env> {
         }
       }
     };
-  }
-
-  /**
-   * Runs before EVERY model step (including the first). Clip bulky stale
-   * payloads in older messages so the model-facing context stays flat no matter
-   * how long or tool-heavy the session became — the fix for turns that stalled
-   * once the replayed transcript (full-file read_file/save_version blobs) grew
-   * large. The recent window is left verbatim so the model still sees the
-   * current file to edit. Deterministic and cheap (string slicing, no model
-   * call), so it can never no-op the way summary compaction did.
-   */
-  beforeStep(ctx: PrepareStepContext): StepConfig | void {
-    const messages = (ctx as unknown as { messages?: ModelMessage[] }).messages;
-    if (!Array.isArray(messages) || messages.length <= KEEP_RECENT_MESSAGES) return;
-    // `messages` is a valid per-step override (AI SDK PrepareStepResult); cast
-    // past a minor type-version skew between Think's bundled `ai` and ours.
-    return { messages: boundContext(messages) } as unknown as StepConfig;
   }
 
   /** RPC stub for this room's AppHost (same room id => this.name). */
@@ -368,7 +380,13 @@ export class CodeAssistant extends Think<Env> {
     };
   }
 
-  getTools(): ToolSet {
+  /**
+   * The individual bridged tools. Each `execute` runs HOST-SIDE (trusted) and
+   * touches app code only through AppHost's build-gated methods. These are used
+   * two ways: exposed directly to the model (getTools), and — a curated subset —
+   * exposed INSIDE the Code Mode sandbox (see getTools + CODE_MODE_SANDBOX_TOOLS).
+   */
+  #toolDefs(): ToolSet {
     return {
       list_files: tool({
         description: "List the paths of the app's current live files.",
@@ -546,5 +564,41 @@ export class CodeAssistant extends Think<Env> {
         }
       })
     };
+  }
+
+  /**
+   * The tools the model can call. All the bridged tools directly, PLUS a
+   * `code_mode` tool that lets the model write ONE orchestration script over a
+   * curated subset of them.
+   *
+   * ISOLATION (invariant #11): the Code Mode script runs in its own Dynamic
+   * Worker via `DynamicWorkerExecutor`, which defaults to `globalOutbound: null`
+   * (no egress) and receives ONLY ToolDispatchers for CODE_MODE_SANDBOX_TOOLS —
+   * never `env`, a binding, or a workspace/state provider. Each dispatched tool's
+   * `execute` still runs host-side and still writes through AppHost.setFiles's
+   * build-gate, so the untrusted-app boundary and the promote path are unchanged.
+   * This adds a SECOND sandbox (for the assistant's orchestration); the app's own
+   * sandbox in runner.ts is untouched.
+   */
+  getTools(): ToolSet {
+    const defs = this.#toolDefs();
+
+    // Curated read/edit subset handed into the sandbox (never rollback/reset).
+    const sandboxTools: ToolSet = {};
+    for (const name of CODE_MODE_SANDBOX_TOOLS) sandboxTools[name] = defs[name];
+
+    const executor = new DynamicWorkerExecutor({
+      loader: this.env.LOADER
+      // globalOutbound defaults to null (fully isolated) — do NOT pass a Fetcher
+      // or any bindings; the sandbox reaches the host only via the tool RPC.
+    });
+
+    const code_mode = createCodeTool({
+      tools: [aiTools(sandboxTools)],
+      executor,
+      description: CODE_MODE_DESCRIPTION
+    });
+
+    return { ...defs, code_mode };
   }
 }

@@ -55,7 +55,9 @@ Object; each request runs the live version in an isolated Dynamic Worker; edits
   Shows the live app (the game) by default; an **Edit** button reveals the
   editor tools (Run/preview, **Chat**, Code, History). The **Chat** panel is a
   vanilla-JS client for `CodeAssistant`, speaking the Agents chat WebSocket
-  protocol (`cf_agent_chat_*`) on `/agents/code-assistant/<room>`.
+  protocol (`cf_agent_chat_*`) on `/agents/code-assistant/<room>`. In edit mode it
+  also opens a read-only `?spectate=1` WS to `/agents/app-host/<room>` to keep the
+  header status/version live via `cf_agent_state` (see "Live status feed" below).
 
 ## Multi-room
 
@@ -135,6 +137,22 @@ per room (app + assistant), same id.
     (dofs needs `node:crypto`/`node:events`). Regenerate the bundle with
     `npm run build:facet` after editing the facet or bumping vendored dofs.
 
+11. **The Code Mode sandbox gets ONLY tool dispatchers — never a binding.** The
+    assistant's `code_mode` tool (`@cloudflare/codemode`, wired in
+    `CodeAssistant.getTools`) lets the model write ONE orchestration script that
+    runs in its OWN Dynamic Worker via `DynamicWorkerExecutor`. That executor is
+    constructed with `{ loader: this.env.LOADER }` ONLY: `globalOutbound` stays at
+    its default `null` (no egress), and NO `env`/`bindings` are passed. The script
+    reaches the host solely through Workers RPC to the curated
+    `CODE_MODE_SANDBOX_TOOLS` (read/edit tools — NOT `rollback`/`reset_app`, NOT
+    `code_mode` itself). Those tool `execute` bodies run host-side and still write
+    through `AppHost.setFiles` (the build-gate). So Code Mode adds a SECOND sandbox
+    for the assistant's ORCHESTRATION; the untrusted-app sandbox (`runner.ts`) and
+    the promote path are unchanged. NEVER feed Think's workspace/state tools (or
+    any binding-backed provider) into `createCodeTool` — that would hand the
+    sandbox a filesystem/resource it must not have. This is why we use
+    `@cloudflare/codemode` directly rather than Think's workspace-coupled helpers.
+
 ## The runtime contract apps must follow
 
 Default export `fetch(request, env)`; HTML page at `/`; persist via
@@ -153,8 +171,10 @@ sync — that prompt is what the AI reads when writing app code).
 
 - **Live reload:** `AppHost.setFiles` (and `rollback`) broadcast `{type:"reload"}`
   to all connected clients when a version is PROMOTED (build succeeded), debounced
-  by `RELOAD_DEBOUNCE_MS` (750 ms) so a multi-promote turn = one reload; a failed
-  build never reloads. App pages opt in by handling the frame.
+  by `RELOAD_DEBOUNCE_SECONDS` (0.75 s) so a multi-promote turn = one reload; a
+  failed build never reloads. The debounce is backed by a DO alarm
+  (`this.schedule(..., "flushReload", ...)`), not `setTimeout`, so it survives
+  hibernation. App pages opt in by handling the frame.
 - **Player identity:** seats bind to the `?token=` on the WS URL. `room.html`
   mints a per-tab id and writes it into the tab's address bar (`?player=`, via
   `replaceState`) and forwards it to the preview iframe — so multiple tabs are
@@ -168,6 +188,11 @@ Editing is a multi-turn CHAT with `CodeAssistant` (Think), not a one-shot call.
 The model runs an agentic loop over host-side tools: `list_files`, `read_file`,
 `apply_line_edits` (the FAST path — reuses `applyEdits` from `src/author/`),
 `save_version`, `preview`, `list_versions`, `rollback`, `reset_app`, `get_state`.
+There is also a `code_mode` tool (Code Mode, `@cloudflare/codemode`): the model
+writes ONE async arrow function that orchestrates the read/edit tools in a single
+step (fewer round-trips) for MECHANICAL multi-step work — it runs isolated in its
+own Dynamic Worker (no egress, no bindings; see invariant #11) and cannot reason
+between steps, so it complements — not replaces — the individual tools.
 Every write goes through `AppHost.setFiles`, so the build-gate + version history
 are unchanged: broken code is saved-not-promoted, good code auto-promotes. The
 loop reading a returned build error and fixing it IS the self-heal (no separate
@@ -244,10 +269,20 @@ After editing `wrangler.jsonc`, run `npm run types` to regenerate
   `^6`, NOT v7; `zod` v4; `@cloudflare/shell`; codemode; just-bash), so the
   bundle is large (~5 MB gzip, and this dominates the host bundle). We install the
   minimal set — no React / `@cloudflare/ai-chat` (vanilla client) and Think's
-  code-execution/browser/extension tools stay unused. `Think` peer-depends on
-  `agents >=0.17.1`, which our pinned `0.17.3` satisfies (no bump needed; vendored
-  dofs has no `agents` dep). `CodeAssistant` is a new SQLite DO — its migration is
-  `tag: "v2"` in `wrangler.jsonc`.
+  workspace/bash/extension tools stay gated OFF (`workspaceBash = false` +
+  `beforeTurn` `activeTools`). `Think` peer-depends on `agents >=0.17.1`, which our
+  pinned `0.17.3` satisfies (no bump needed; vendored dofs has no `agents` dep).
+  `CodeAssistant` is a new SQLite DO — its migration is `tag: "v2"` in
+  `wrangler.jsonc`.
+- **Code Mode is used directly, not via Think.** `@cloudflare/codemode` (already
+  in the tree as a Think transitive dep, now pinned explicitly in `package.json`)
+  powers the assistant's `code_mode` tool. We import `createCodeTool`/`aiTools`
+  from `@cloudflare/codemode/ai` and `DynamicWorkerExecutor` from
+  `@cloudflare/codemode` DIRECTLY — NOT Think's `./tools/execute` (which 0.13
+  doesn't export, and which couples to Think's workspace). Direct use lets us pass
+  ONLY the curated `CODE_MODE_SANDBOX_TOOLS` into the sandbox and keep
+  `globalOutbound: null` (invariant #11). No new binding is needed — it reuses the
+  existing `LOADER`.
 - **App runtime data lives in a facet (`AppStorageFacet`), not AppHost.** Both the
   key/value store and the dofs filesystem run in the facet's own isolated SQLite;
   AppHost's `store*`/`fs*` methods are thin forwarders. Only the realtime
@@ -279,13 +314,49 @@ After editing `wrangler.jsonc`, run `npm run types` to regenerate
   return the last GOOD version, not a failed attempt. The failed-build tool result
   says so and steers the model to re-read or use `save_version` (whole file);
   without that, a model iterating on stale line numbers snowballs into corruption.
-- **Reasoning-model guards** live in `beforeTurn`: `maxOutputTokens` (avoid the
-  `finishReason:"length"` cutoff before an edit is emitted) + `reasoning_effort`
-  (`ASSISTANT_REASONING_EFFORT`, default `medium`). `reasoning_effort` goes under
-  `providerOptions["workers-ai"]`.
-- **Live reload:** `#broadcastReload` (debounced 750 ms) fires only on a
-  successful promote; app pages must handle `{type:"reload"}`. Non-realtime apps
-  (no WS, e.g. `counter`) can't receive it — reload manually.
+ - **Reasoning-model guards** live in `beforeTurn`: `maxOutputTokens` (avoid the
+   `finishReason:"length"` cutoff before an edit is emitted) + `reasoning_effort`
+   (`ASSISTANT_REASONING_EFFORT`, default `medium`). `reasoning_effort` goes under
+   `providerOptions["workers-ai"]`.
+ - **Context management uses Think's built-ins, not a hand-rolled pass.** There is
+   no longer a `beforeStep` clipping hook. Long/tool-heavy transcripts are kept in
+   check by (1) DETERMINISTIC compaction registered in `configureSession`
+   (`onCompaction(createCompactFunction({ summarize: () => COMPACTION_SUMMARY }))`
+   + `compactAfter(CONTEXT_TOKEN_BUDGET)`) — the `summarize` returns a fixed
+   re-read marker so it costs no model call and can never no-op; (2)
+   `this.contextOverflow` (proactive compaction before overflow + a reactive
+   compact-and-retry backstop, keyed off `classifyChatError =
+   defaultContextOverflowClassifier`); (3) `this.mediaEviction` (drops big aged
+   tool-output blobs from durable storage); and (4) `this.chatRecovery` (durable
+   fiber so a deploy/eviction/stall mid-turn resumes instead of stalling). These
+   are all TRANSCRIPT-level (the assistant's own Session/DO SQLite) — they never
+   touch app files or the app sandbox, so they don't affect isolation. Compaction
+   relies on the app being re-readable: the system prompt already tells the model
+   to re-read files, which the compaction marker reinforces.
+- **Live reload:** `#broadcastReload` (debounced `RELOAD_DEBOUNCE_SECONDS` =
+  0.75 s) fires only on a successful promote; app pages must handle
+  `{type:"reload"}`. Non-realtime apps (no WS, e.g. `counter`) can't receive it —
+  reload manually. The debounce is backed by a Durable Object ALARM
+  (`this.schedule(RELOAD_DEBOUNCE_SECONDS, "flushReload", {version})`), NOT
+  `setTimeout`: a plain timer is lost if the DO hibernates during the window,
+  silently dropping the reload; the alarm survives hibernation. Each new promote
+  `cancelSchedule`s the pending one and re-arms (coalescing a burst into one
+  reload). `flushReload` is a public (non-`#private`) callback because the Agent
+  scheduler invokes it by key.
+- **Version-history GC** runs on a recurring alarm: `onStart` calls
+  `this.scheduleEvery(VERSION_GC_INTERVAL_SECONDS, "gcVersions")` (idempotent, so
+  one schedule survives every DO wake). `gcVersions` calls `db.pruneVersions`,
+  which keeps the newest `VERSION_HISTORY_KEEP` (50) versions PLUS the active one
+  and deletes the rest from `files`+`versions` — so history can't grow unbounded.
+- **Live status feed (editor chrome):** `room.html` opens a READ-ONLY WS to
+  `/agents/app-host/<room>?spectate=1` to watch AppHost's synced state via the
+  Agents `cf_agent_state` protocol (initial frame on connect + a frame on every
+  `setState`), keeping the editor header live when the version changes without a
+  local action (assistant promote, another tab's edit). `?spectate=1` makes
+  `AppHost.onConnect` SKIP the coordinator (tagging the connection with
+  `SPECTATOR_TOKEN`), so the editor takes NO game seat and is filtered out of game
+  broadcasts/presence (`#roomHost().roomConnections`). The on-load `/api/state`
+  fetch stays as the fallback.
 - **Player identity is per-tab, in the URL** (`room.html` `?player=`), with a
   `localStorage` fallback in app pages. Old `.wrangler/` rooms may keep the prior
   scheme until reseeded.

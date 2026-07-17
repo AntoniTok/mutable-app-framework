@@ -232,6 +232,8 @@ Browser Chat panel --ws--> /agents/code-assistant/<room> --> CodeAssistant (Thin
         → agentic loop: model calls host-side TOOLS → reads results → loops
             read_file / list_files / preview / list_versions / get_state   (read)
             apply_line_edits (FAST path) / save_version / rollback / reset_app
+            code_mode: ONE script orchestrating the read/edit tools in an
+                       isolated Dynamic Worker (fewer round-trips; see below)
         → every edit tool calls AppHost.setFiles(): saves the version, bundles it.
           Only if it builds does the live pointer move (auto-promote); a broken
           build is saved but NOT promoted — the last good version stays live.
@@ -438,11 +440,37 @@ The realtime channel normally carries only game **state**, so a code change
 (AI edit, manual save, rollback) wouldn't reach clients already running the old
 page. On every successful **promote**, `AppHost` broadcasts a `{type:"reload"}`
 frame to all connected clients; the app page reloads and re-fetches the new
-version. Broadcasts are **debounced** (`RELOAD_DEBOUNCE_MS`, 750 ms) so a
+version. Broadcasts are **debounced** (`RELOAD_DEBOUNCE_SECONDS`, 0.75 s) so a
 multi-promote AI turn triggers a single reload on the final good version, and a
 **failed** build (not promoted) never reloads anyone. Realtime app pages opt in
 by handling the frame (the bundled templates do; the assistant's system prompt
 tells AI-authored pages to keep it).
+
+The debounce is backed by a **Durable Object alarm** (`this.schedule(...,
+"flushReload", ...)`), not a `setTimeout`: a bare timer would be lost if the DO
+hibernated mid-window and silently drop the reload, whereas the alarm survives
+hibernation. Each promote cancels the pending alarm and re-arms it.
+
+#### Live status (editor)
+
+The room's **Edit** chrome shows the live version + build status. To keep those
+current when the version changes *without a local action* — e.g. the AI promotes
+a build, or **another tab** edits the same room — `room.html` opens a read-only
+WebSocket to `/agents/app-host/<room>?spectate=1` and watches AppHost's synced
+state over the Agents `cf_agent_state` protocol (a frame on connect and on every
+`setState`). The `?spectate=1` flag tells `AppHost` to treat the connection as a
+pure state subscriber: it **skips the realtime coordinator**, so the editor takes
+**no game seat** and is excluded from game broadcasts/presence. The on-load
+`/api/state` fetch remains the fallback if the socket never opens.
+
+#### Version-history GC
+
+Every edit adds a version, so unbounded history would grow the DO's SQLite
+forever. `AppHost` sweeps it on a recurring **alarm** — `onStart` arms
+`this.scheduleEvery(VERSION_GC_INTERVAL_SECONDS, "gcVersions")` (idempotent, so
+it stays a single daily schedule across DO wakes) — keeping the newest
+`VERSION_HISTORY_KEEP` (50) versions plus the currently-active one and pruning the
+rest (`schema.pruneVersions`).
 
 #### Player identity (reconnection)
 
@@ -545,6 +573,28 @@ version history and realtime state). The default room is `main`.
   host worker). We install the minimal set: no React / `@cloudflare/ai-chat` (the
   Chat panel is vanilla JS), and Think's workspace/bash/code-execution tools are
   gated off. `Think`'s peer `agents >=0.17.1` is satisfied by the pinned `0.17.3`.
+- **Code Mode (`@cloudflare/codemode`).** The assistant also has a `code_mode`
+  tool that lets the model write ONE orchestration script over the read/edit
+  tools — fewer round-trips for mechanical multi-step edits. The script runs in
+  its own isolated Dynamic Worker (no egress, no bindings; only tool-dispatcher
+  RPC back to the build-gated tools), so it preserves the sandbox boundary. We use
+  `@cloudflare/codemode` directly (not Think's workspace-coupled execute tool) so
+  we control exactly which tools the sandbox can reach. Reuses the `LOADER`
+  binding — no new config.
+- **Context management is Think's, not hand-rolled.** A long, tool-heavy chat can
+  balloon the transcript until the model call stalls before emitting a tool call
+  (the turn appears to "do nothing", and since history only grows, every later
+  turn fails the same way). Instead of a custom truncation pass we use Think's
+  built-ins: deterministic **compaction** (`configureSession` →
+  `onCompaction(createCompactFunction(...))` + `compactAfter(CONTEXT_TOKEN_BUDGET)`,
+  ~120k tokens; the summary is a fixed "re-read the files" marker so it costs no
+  model call and can't no-op), `contextOverflow` (proactive compaction + a
+  reactive compact-and-retry backstop), `mediaEviction` (drops big aged tool-output
+  blobs), and `chatRecovery` (durable fiber so a deploy/eviction/stall mid-turn
+  resumes instead of stalling). All operate on the assistant's OWN transcript
+  (Session/DO SQLite) — they never touch app files or the app sandbox, so they
+  don't affect isolation. Compaction relies on the app being re-readable, which
+  the system prompt already instructs.
 - **App runtime data lives in a facet.** The key/value store and the dofs
   filesystem run in `AppStorageFacet` (its own isolated SQLite), not AppHost; the
   broker still mediates every call. dofs is bundled into the facet (tree-shaken),

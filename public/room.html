@@ -196,8 +196,9 @@
         const editing = document.body.classList.toggle("editing");
         $("editToggle").textContent = editing ? "Done" : "Edit";
         $("editToggle").classList.toggle("on", editing);
-        // Open the assistant connection the first time the tools are revealed.
-        if (editing) Chat.connect();
+        // Open the assistant + live-status connections the first time the tools
+        // are revealed (both are edit-only chrome).
+        if (editing) { Chat.connect(); StateFeed.connect(); }
       };
 
       $("copyLink").onclick = async () => {
@@ -304,6 +305,51 @@
         await loadState();
         await Promise.all([loadVersions(), loadFiles()]);
       }
+
+      // ── Live status feed (Agents cf_agent_state) ──
+      // A READ-ONLY WebSocket to this room's AppHost that rides the Agents state
+      // protocol: on connect and on every server-side setState, AppHost pushes a
+      // {type:"cf_agent_state"} frame with {activeVersion,status,lastError}. This
+      // keeps the editor header live when the version changes WITHOUT us doing an
+      // action — e.g. the assistant promotes a build, or another tab edits the
+      // room. We pass ?spectate=1 so AppHost does NOT enrol us as a game player
+      // (no seat, no presence). The on-load /api/state fetch (in syncAll) remains
+      // the fallback if this socket never opens.
+      const StateFeed = (() => {
+        let ws = null;
+        function wsUrl() {
+          const proto = location.protocol === "https:" ? "wss" : "ws";
+          return proto + "://" + location.host + "/agents/app-host/" +
+            encodeURIComponent(ROOM) + "?spectate=1";
+        }
+        function apply(state) {
+          if (!state || typeof state.activeVersion !== "number") return;
+          liveVersion = state.activeVersion;
+          const el = $("status");
+          el.textContent = state.status;
+          el.className = state.status + " edit-only";
+          $("version").textContent = "live: v" + state.activeVersion;
+          // Keep the history list's "live" marker current if it's open. We do NOT
+          // touch the code buffer or preview here — that would clobber an edit in
+          // progress; the live game reloads itself via the coordinator's reload
+          // frame, and manual "Reload" re-syncs the editor on demand.
+          if (!$("historyDrawer").classList.contains("hidden")) {
+            loadVersions().catch(() => {});
+          }
+        }
+        function connect() {
+          if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+          ws = new WebSocket(wsUrl());
+          ws.addEventListener("message", (ev) => {
+            let m; try { m = JSON.parse(ev.data); } catch { return; }
+            if (m.type === "cf_agent_state") apply(m.state);
+          });
+          // Auto-reconnect so live status survives brief drops (e.g. DO restart).
+          ws.addEventListener("close", () => { ws = null; setTimeout(connect, 2000); });
+          ws.addEventListener("error", () => { try { ws.close(); } catch {} });
+        }
+        return { connect };
+      })();
 
       // ── Actions ──
       $("save").onclick = async () => {

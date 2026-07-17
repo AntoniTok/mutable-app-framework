@@ -50,13 +50,32 @@ const DEFAULT_ENTRYPOINT = "src/index.js";
 const ROOM_SCOPE = "__room__";
 
 /**
+ * Sentinel connection token for a READ-ONLY state subscriber (the editor chrome
+ * in room.html) that watches AppHost's synced state (`activeVersion`/`status`/
+ * `lastError`) live via the Agents `cf_agent_state` protocol. Such a connection
+ * must NOT join the realtime game — it gets no seat and no game frames — so we
+ * tag it and keep it out of the coordinator entirely (see onConnect /
+ * #roomHost().roomConnections). Chosen to never collide with a real player token
+ * (`?token=` is sanitized to [A-Za-z0-9_-]).
+ */
+const SPECTATOR_TOKEN = "__spectator__";
+
+/**
  * How long to wait for the live version to "settle" before telling connected
  * clients to reload (see #broadcastReload). One AI turn may promote several
  * times; this coalesces that burst into a single reload so players aren't
  * interrupted repeatedly. Long enough to absorb a multi-step turn, short enough
- * that others see the change promptly.
+ * that others see the change promptly. Expressed in seconds because it's backed
+ * by a Durable Object ALARM (this.schedule) rather than setTimeout, so the
+ * pending reload survives DO hibernation instead of being silently dropped.
  */
-const RELOAD_DEBOUNCE_MS = 750;
+const RELOAD_DEBOUNCE_SECONDS = 0.75;
+
+/** How many versions of history to retain per room (see schema.pruneVersions). */
+const VERSION_HISTORY_KEEP = 50;
+
+/** How often to sweep old version history (seconds). */
+const VERSION_GC_INTERVAL_SECONDS = 24 * 60 * 60;
 
 /** Encode a string to a standalone ArrayBuffer (RPC-serializable body). */
 function encodeUtf8(text: string): ArrayBuffer {
@@ -92,6 +111,11 @@ export class AppHost extends Agent<Env, HostState> {
         lastError: null
       });
     }
+
+    // Recurring version-history GC. `scheduleEvery` is idempotent, so calling it
+    // on every DO wake (onStart) creates exactly one schedule, not a duplicate
+    // per boot. Backed by a DO alarm.
+    await this.scheduleEvery(VERSION_GC_INTERVAL_SECONDS, "gcVersions");
   }
 
   // ── Run the current app (preview) ──
@@ -153,9 +177,10 @@ export class AppHost extends Agent<Env, HostState> {
 
   #room?: RoomCoordinator;
 
-  // Debounce state for the live-reload broadcast (see #broadcastReload).
-  #reloadTimer?: ReturnType<typeof setTimeout>;
-  #pendingReloadVersion?: number;
+  // Debounce state for the live-reload broadcast (see #broadcastReload). Holds
+  // the id of the pending alarm-backed schedule so a new promote can cancel and
+  // reschedule it (coalescing a burst into one reload).
+  #pendingReloadScheduleId?: string;
 
   #coordinator(): RoomCoordinator {
     if (!this.#room) this.#room = new RoomCoordinator(this.#roomHost());
@@ -172,7 +197,12 @@ export class AppHost extends Agent<Env, HostState> {
       roomActiveVersion: () => this.state.activeVersion,
       broadcast: (msg) => this.broadcast(msg),
       roomConnections: () =>
-        this.getConnections() as Iterable<Connection<ConnState>>,
+        // Exclude read-only state subscribers: they aren't players, so they must
+        // not count toward presence/seat-reclaim and must not receive game
+        // frames. They still get `cf_agent_state` via the base Agent broadcast.
+        [...(this.getConnections() as Iterable<Connection<ConnState>>)].filter(
+          (c) => c.state?.token !== SPECTATOR_TOKEN
+        ),
       roomGet: (k) => db.appDataGet(this, ROOM_SCOPE, k),
       roomPut: (k, v) => db.appDataPut(this, ROOM_SCOPE, k, v)
     };
@@ -180,16 +210,31 @@ export class AppHost extends Agent<Env, HostState> {
 
   async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
     const url = new URL(ctx.request.url);
+    // Read-only state subscriber (editor chrome): skip the coordinator so it gets
+    // no seat/presence. The base Agent already sent the initial `cf_agent_state`
+    // before this handler ran, and every later setState re-broadcasts it — that's
+    // all this connection wants. We tag it so it's filtered from game broadcasts.
+    if (url.searchParams.get("spectate") === "1") {
+      (connection as Connection<ConnState>).setState({
+        token: SPECTATOR_TOKEN,
+        seat: null
+      });
+      return;
+    }
     const token = url.searchParams.get("token") || crypto.randomUUID();
     await this.#coordinator().onConnect(connection as Connection<ConnState>, token);
   }
 
   async onMessage(connection: Connection, message: WSMessage): Promise<void> {
     if (typeof message !== "string") return; // JSON text frames only
+    // State subscribers are read-only — they never drive game actions.
+    if ((connection as Connection<ConnState>).state?.token === SPECTATOR_TOKEN) return;
     await this.#coordinator().onMessage(connection as Connection<ConnState>, message);
   }
 
   async onClose(connection: Connection): Promise<void> {
+    // A state subscriber was never a player, so there's no presence to refresh.
+    if ((connection as Connection<ConnState>).state?.token === SPECTATOR_TOKEN) return;
     await this.#coordinator().onClose(connection as Connection<ConnState>);
   }
 
@@ -243,7 +288,7 @@ export class AppHost extends Agent<Env, HostState> {
       // reloads its own preview) would see it; everyone else would run stale code
       // until a manual refresh. Skip the very first seed (nothing to reload yet).
       if (previousVersion !== version && previousVersion !== 0) {
-        this.#broadcastReload(version);
+        await this.#broadcastReload(version);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -263,7 +308,7 @@ export class AppHost extends Agent<Env, HostState> {
     // Reflect whether the version we rolled back to actually builds.
     await this.validateActive();
     // Rolling back also changes the live code — propagate to all clients.
-    if (previousVersion !== version) this.#broadcastReload(version);
+    if (previousVersion !== version) await this.#broadcastReload(version);
   }
 
   /**
@@ -277,18 +322,39 @@ export class AppHost extends Agent<Env, HostState> {
    * DEBOUNCED: a single AI turn can promote more than once (e.g. a save plus a
    * follow-up fix). Reloading players on each promote would flicker/interrupt
    * them repeatedly, so we coalesce a burst into ONE reload on the LATEST good
-   * version, fired only after `RELOAD_DEBOUNCE_MS` of quiet. Each new promote
-   * resets the timer.
+   * version, fired only after `RELOAD_DEBOUNCE_SECONDS` of quiet. Each new promote
+   * cancels the pending schedule and re-arms it.
+   *
+   * Backed by a Durable Object alarm (`this.schedule`) rather than `setTimeout`:
+   * a plain timer is lost if the DO hibernates during the debounce window, which
+   * would silently drop the reload; the alarm survives hibernation.
    */
-  #broadcastReload(version: number): void {
-    this.#pendingReloadVersion = version;
-    if (this.#reloadTimer !== undefined) clearTimeout(this.#reloadTimer);
-    this.#reloadTimer = setTimeout(() => {
-      this.#reloadTimer = undefined;
-      const v = this.#pendingReloadVersion;
-      this.#pendingReloadVersion = undefined;
-      if (v !== undefined) this.broadcast(JSON.stringify({ type: "reload", version: v }));
-    }, RELOAD_DEBOUNCE_MS);
+  async #broadcastReload(version: number): Promise<void> {
+    if (this.#pendingReloadScheduleId) {
+      await this.cancelSchedule(this.#pendingReloadScheduleId);
+      this.#pendingReloadScheduleId = undefined;
+    }
+    const scheduled = await this.schedule(RELOAD_DEBOUNCE_SECONDS, "flushReload", { version });
+    this.#pendingReloadScheduleId = scheduled.id;
+  }
+
+  /**
+   * Alarm callback: emit the coalesced reload frame for the latest good version.
+   * Invoked by the Agent scheduler (not RPC). Named (not #private) because
+   * `this.schedule(..., callback)` references it by key.
+   */
+  flushReload(payload: { version: number }): void {
+    this.#pendingReloadScheduleId = undefined;
+    this.broadcast(JSON.stringify({ type: "reload", version: payload.version }));
+  }
+
+  /**
+   * Alarm callback: prune old version history so `files`/`versions` can't grow
+   * without bound. Keeps the newest `VERSION_HISTORY_KEEP` versions plus the
+   * active one. Invoked by the recurring schedule armed in onStart.
+   */
+  gcVersions(): void {
+    db.pruneVersions(this, VERSION_HISTORY_KEEP, this.state.activeVersion);
   }
 
   /** Try to build the live version; set status to ready or error accordingly. */
