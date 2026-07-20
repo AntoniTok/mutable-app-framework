@@ -9,7 +9,9 @@ the app — by hand or by asking an AI — and the next request runs the new cod
 **No redeploy, no restart.** Every change is versioned, so you can roll back.
 
 > Status: learning prototype. Uses preview-grade Cloudflare APIs (Dynamic Worker
-> Loader, `@cloudflare/worker-bundler`). Fine for experiments; not production.
+> Loader, `@cloudflare/worker-bundler`). Fine for experiments; not production —
+> see [Hardening status](#hardening-status) for what's been addressed and what
+> still blocks real use (notably auth and quotas).
 
 ---
 
@@ -699,4 +701,33 @@ version history and realtime state). The default room is `main`.
   scheme until reseeded.
 - **Local state persists** across `wrangler dev` restarts (Durable Object
   storage in `.wrangler/`), so your versions survive restarts.
-```
+
+---
+
+## Hardening status
+
+This started as a learning prototype; several rough edges have since been
+hardened. The list below tracks that work (the `#N` ids are referenced from
+code comments and `AGENTS.md`). It is **still not production-ready** — the
+outstanding items below (auth, quotas) matter before any real exposure.
+
+**Resolved**
+
+| # | Limitation | Resolution |
+| --- | --- | --- |
+| #1 | An edit wiped in-progress realtime state | State is preserved across edits: KEEP → `migrate` → RESET, gated by a sandboxed `probe` (`coordinator.#ensureFreshState`). |
+| #2 | `get()+put()` races lost updates | Atomic `incr`/`cas` run in one DO method under the input gate (`ScopedStore`, `AppData`). |
+| #3 | Storage funneled through the code DO (3 hops) | App data moved to a top-level `AppData` DO reached directly by the scoped stubs (2 hops, no funnel). |
+| #4 | Bundler ran on the request path | Builds are precompiled on promote and persisted (`schema.builds`); the run path skips esbuild on a cold cache. |
+| #7 | Apps could only reach a KV store | Added a filesystem (dofs), an R2-backed blob store, and mediated allowlisted egress — all via the broker. |
+| #9 | A self-imposed no-backtick rule made edits fragile | Dropped it: code is bundled (esbuild), so template literals are the preferred, robust way to build the HTML page. |
+| #10 | App-owned data had no migration path | Optional `onUpgrade(env, ctx)` runs once per forward promote to migrate the app's own store/fs/blob data. |
+
+**Outstanding**
+
+| # | Limitation | Notes |
+| --- | --- | --- |
+| #5 | No quotas / resource limits / rate limiting | No per-run `limits.cpuMs`/`subRequests`, no request throttling — a runaway or hostile app/room is unbounded. |
+| #6 | No authentication | Rooms are unauthenticated and their ids are guessable; anyone with a room id can view/edit its app. |
+| #8 | Build-gate ≠ correctness | A version can compile yet be logically broken; the build check catches syntax/type errors only. |
+| #11 | Operational ceilings | Preview-grade APIs (Worker Loader, `worker-bundler`), the assistant's bundle parse cost, and model reliability all cap real-world use. |

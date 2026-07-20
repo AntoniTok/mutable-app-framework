@@ -9,6 +9,17 @@ A self-modifying app framework: an app's source lives as data in a Durable
 Object; each request runs the live version in an isolated Dynamic Worker; edits
 (manual or AI) create new versions with no redeploy.
 
+## Hardening status (the `#N` ids used throughout)
+
+Resolved: **#1** state preservation across edits, **#2** atomic KV (`incr`/`cas`),
+**#3** app data in a direct-reached top-level `AppData` DO (no AppHost funnel),
+**#4** precompiled builds off the request path, **#7** fs/blob/egress capabilities,
+**#9** template literals allowed (no-backtick rule dropped), **#10** `onUpgrade`
+app-data migration. Outstanding (do NOT assume these are handled): **#5** no
+quotas/resource-limits/rate-limiting, **#6** no auth (rooms are guessable),
+**#8** build-gate catches syntax/type errors only (not logic), **#11**
+preview-grade APIs + bundle/model ceilings. Full table: README "Hardening status".
+
 ## Where things are
 
 - `src/server.ts` — entry Worker; routes `/api/*` (incl. `/api/egress`),

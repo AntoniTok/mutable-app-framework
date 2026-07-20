@@ -147,6 +147,21 @@ sandbox (`runner.ts`, which injects the `SYSTEM` broker) and the assistant's
 *orchestration* sandbox (Code Mode, which injects nothing — only tool-dispatcher
 RPC). Both keep `globalOutbound: null` and hand out no real bindings.
 
+Beyond serving `fetch`, the app sandbox also exposes a framework-injected adapter
+(a second `Logic` entrypoint bundled alongside the app) that invokes the app's
+optional exports: the pure realtime functions `applyAction`/`initialState`/
+`view`/`seats`, the state-preservation `probe`/`migrate` (limitation #1), and —
+newest — `onUpgrade(env, ctx)` (limitation #10), which runs with the app's own
+`SYSTEM` broker to migrate the app's persisted store/fs/blob data across a code
+change. See `runner.ts` (`reduce`/`project`/`probe`/`migrate`/`runUpgrade`).
+
+Because `@cloudflare/worker-bundler` (esbuild) ALWAYS runs before the app
+executes, apps are free to use modern JS — in particular **template literals
+(backticks + `${}`)**, which is the preferred way to build the HTML page
+(limitation #9). The example seeds under `templates/examples/` avoid inner
+backticks only because their source is embedded as a string inside `.ts` files;
+that is an embedding quirk of the seeds, not a runtime constraint.
+
 ### `@cloudflare/think` — used, deliberately trimmed
 
 **Used:** `Think` base (`CodeAssistant`), `getModel`/`getSystemPrompt`,
