@@ -108,6 +108,63 @@ export class AppStorageFacet extends DurableObject {
       .map((r) => r.k);
   }
 
+  /**
+   * Atomically add `delta` to a numeric value and return the new total. A
+   * missing key starts at 0. This whole method runs under the facet's input gate
+   * (no `await` splits it), so concurrent increments can't lose updates — the
+   * fix for the read-modify-write race on the plain HTTP path (limitation #2).
+   */
+  async storeIncr(scope: string, key: string, delta: number): Promise<number> {
+    const rows = this.ctx.storage.sql
+      .exec<{ v: string }>(
+        "SELECT v FROM app_data WHERE scope = ? AND k = ?",
+        scope,
+        key
+      )
+      .toArray();
+    const current = rows.length ? Number(rows[0].v) : 0;
+    if (!Number.isFinite(current)) {
+      throw new Error(`storeIncr: value at "${key}" is not numeric ("${rows[0].v}").`);
+    }
+    const next = current + delta;
+    this.ctx.storage.sql.exec(
+      "INSERT INTO app_data (scope, k, v) VALUES (?, ?, ?) ON CONFLICT (scope, k) DO UPDATE SET v = excluded.v",
+      scope,
+      key,
+      String(next)
+    );
+    return next;
+  }
+
+  /**
+   * Atomic compare-and-swap: write `next` only if the current value equals
+   * `expected` (`null` means "the key must be absent"). Returns whether the swap
+   * happened. Lets an app build its own safe read-modify-write loops.
+   */
+  async storeCas(
+    scope: string,
+    key: string,
+    expected: string | null,
+    next: string
+  ): Promise<boolean> {
+    const rows = this.ctx.storage.sql
+      .exec<{ v: string }>(
+        "SELECT v FROM app_data WHERE scope = ? AND k = ?",
+        scope,
+        key
+      )
+      .toArray();
+    const current = rows.length ? rows[0].v : null;
+    if (current !== expected) return false;
+    this.ctx.storage.sql.exec(
+      "INSERT INTO app_data (scope, k, v) VALUES (?, ?, ?) ON CONFLICT (scope, k) DO UPDATE SET v = excluded.v",
+      scope,
+      key,
+      next
+    );
+    return true;
+  }
+
   // ── filesystem (invoked by ScopedFilesystem over RPC via AppHost) ──
   //
   // Backed by @cloudflare/dofs: a SQLite-backed virtual filesystem living in

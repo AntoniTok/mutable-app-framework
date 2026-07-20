@@ -11,14 +11,21 @@ Object; each request runs the live version in an isolated Dynamic Worker; edits
 
 ## Where things are
 
-- `src/server.ts` — entry Worker; routes `/api/*`, `/preview/*`, `/agents/*`.
-  Exports the DOs + capability entrypoints + `DynamicWorkerTail`.
+- `src/server.ts` — entry Worker; routes `/api/*` (incl. `/api/egress`),
+  `/preview/*`, `/agents/*`. `handlePreview` runs the app IN the host worker and
+  STREAMS the response. Exports the DOs + all capability entrypoints (store, fs,
+  blob, fetch) + `DynamicWorkerTail`.
 - `src/agent/app-host.ts` — the Agent (DO). Source of truth for CODE + all
-  actions. Forwards the app's runtime data (store + fs) to the facet.
+  actions. Forwards the app's runtime data (store + fs) to the facet; persists
+  precompiled builds; holds the egress allowlist; exposes `getRunManifest`/
+  `getBuild`/`resolvePrebuilt` for the host-worker run path.
 - `src/agent/runner.ts` — runs untrusted app code in a Dynamic Worker (injects
-  the `SYSTEM` broker, `globalOutbound: null`, and attaches the tail worker).
+  the `SYSTEM` broker, `globalOutbound: null`, attaches the tail worker; uses a
+  persisted build on a cold cache via `resolvePrebuilt`). Exposes fetch/reduce/
+  initialState/project/seats/probe/migrate over one injected adapter bundle.
 - `src/agent/schema.ts` — AppHost's SQLite tables + query helpers (`files`,
-  `versions`; `app_data` now holds ONLY the realtime `__room__` scope).
+  `versions`, `builds`; `app_data` holds the realtime `__room__` + `__egress__`
+  scopes).
 - `src/agent/facet/entry.ts` — the `AppStorageFacet` Durable Object: an app's
   runtime data (key/value store + dofs filesystem) in its OWN isolated SQLite,
   run as a facet beneath AppHost. Bundled (with tree-shaken dofs) to a string by
@@ -28,8 +35,10 @@ Object; each request runs the live version in an isolated Dynamic Worker; edits
 - `src/observability/dynamic-worker-tail.ts` — `DynamicWorkerTail`: captures each
   untrusted app run's logs/exceptions/outcome into Workers Logs, tagged by
   `workerId` (attached in `runner.ts`).
-- `src/capabilities/{broker,scoped-store,scoped-filesystem}.ts` — capability
-  sandbox.
+- `src/capabilities/{broker,scoped-store,scoped-filesystem,scoped-blob-store,scoped-fetcher}.ts`
+  — capability sandbox. broker mints store/fs/blob/fetch; store adds atomic
+  `incr`/`cas` + JSON helpers; blob is R2-backed; fetcher is mediated egress
+  (`send`, allowlist-gated).
 - `src/assistant/code-assistant.ts` — the AI coding assistant, a SEPARATE Durable
   Object `CodeAssistant extends Think` (`@cloudflare/think`). One per room, keyed
   by the room id. Runs the agentic loop (model calls host-side tools → reads
@@ -97,9 +106,12 @@ per room (app + assistant), same id.
    (`workspaceBash = false` + `beforeTurn` `activeTools`) so the model can only
    use the bridged tools. `AppHost` already `extends Agent`, so it cannot also
    `extends Think` (single inheritance) — that is why the assistant is a separate DO.
-6. **Lifecycle methods aren't RPC-callable** on the Agents stub. Preview runs via
-   the custom `AppHost.preview()` method (returns serializable data), not
-   `onRequest`. Keep host↔agent calls as explicit public methods. (WebSocket
+6. **Lifecycle methods aren't RPC-callable** on the Agents stub. Keep host↔agent
+   calls as explicit public methods (e.g. `getRunManifest`/`getBuild`/`setFiles`),
+   not `onRequest`. The user-facing `/preview/*` path fetches CODE via
+   `AppHost.getRunManifest()` and runs the app in the HOST worker so the response
+   can stream (see server.ts); the buffered `AppHost.preview()` method remains
+   ONLY for the assistant's `preview` tool (returns serializable data). (WebSocket
    lifecycle — `onConnect`/`onMessage`/`onClose` — is the exception: it's invoked
    by `routeAgentRequest`, and delegates to the realtime coordinator.)
 7. **Realtime apps stay pure.** The untrusted app NEVER holds a socket or does
@@ -156,7 +168,13 @@ per room (app + assistant), same id.
 ## The runtime contract apps must follow
 
 Default export `fetch(request, env)`; HTML page at `/`; persist via
-`env.SYSTEM.requestStore(...)`; no network; relative URLs in HTML. Multiplayer
+`env.SYSTEM.requestStore(...)`; relative URLs in HTML. **Capabilities today:**
+`requestStore` (KV — incl. ATOMIC `incr`/`cas` and JSON `putJSON`/`getJSON`),
+`requestFilesystem` (dofs, ≤256 KiB files), `requestBlobStore` (R2, large
+binaries), and `requestFetch` (MEDIATED egress — the app sandbox stays
+`globalOutbound: null`; `ScopedFetcher.send()` only reaches hosts on the app's
+per-app allowlist, held in trusted AppHost storage and set via `POST /api/egress`
+or a template's `egress: []`, NEVER by the app). Multiplayer
 apps additionally export a pure `applyAction(state, action, ctx)` (+ optional
 `initialState`, `seats`, and `view(state, ctx)` for hidden information) and
 connect a WebSocket to `/agents/app-host/<room>?token=<id>` (the room read from
@@ -267,7 +285,12 @@ After editing `wrangler.jsonc`, run `npm run types` to regenerate
 - **`@cloudflare/think` is EXPERIMENTAL** (Session is imported from
   `agents/experimental/memory/session`). It pulls heavy deps (`ai` v6 — pin
   `^6`, NOT v7; `zod` v4; `@cloudflare/shell`; codemode; just-bash), so the
-  bundle is large (~5 MB gzip, and this dominates the host bundle). We install the
+  bundle is sizeable (measured ~1.46 MB gzip for the whole host worker — WELL
+  under the 3 MB Free / 10 MB paid script-size limits; the earlier "~5 MB gzip"
+  note was the un-tree-shaken on-disk dep size, not the built bundle). Think
+  dominates the bundle's COMPOSITION and cold-start parse cost, not the size
+  ceiling. If that parse cost ever matters, split CodeAssistant into its own
+  Worker service so the app-serving worker stays lean. We install the
   minimal set — no React / `@cloudflare/ai-chat` (vanilla client) and Think's
   workspace/bash/extension tools stay gated OFF (`workspaceBash = false` +
   `beforeTurn` `activeTools`). `Think` peer-depends on `agents >=0.17.1`, which our
@@ -366,4 +389,30 @@ After editing `wrangler.jsonc`, run `npm run types` to regenerate
   the last version that built and `status` flips to `error`. Auto-promotion
   still happens for any version that builds. (Manual `rollback` may still land
   on a broken version on purpose, for inspection.)
+- **State preservation across edits (#1).** A code edit no longer auto-wipes
+  realtime state. `coordinator.#ensureFreshState` runs KEEP → MIGRATE → RESET:
+  it probes the old state against the new bundle (via the sandboxed `probe` in
+  `runner.ts`, which exercises the app's `view`/`initialState`), keeps it if
+  compatible, else runs the app's optional pure `migrate(old, oldVersion)` and
+  keeps that if it re-probes ok, else reseeds `initialState` + clears seats. Keep
+  any existing `migrate`/`stateVersion` exports when editing an app.
+- **Precompiled builds (#4).** `setFiles`/seed persist the bundler output keyed
+  by content hash (`schema.builds`). The runner (`loadWorker`) uses it on a COLD
+  Worker Loader cache instead of re-running esbuild; `resolvePrebuilt` is only
+  consulted inside the cold-cache callback, so warm hits are free. `getBuild` is
+  the RPC the host worker passes as the resolver. Pruned in `gcVersions`.
+- **Streaming run path (#3d/#7).** The user-facing `/preview/*` runs the app in
+  the HOST worker (`server.ts handlePreview` via `AppHost.getRunManifest()` +
+  `runner.runApp`) and STREAMS the response; HTML `<base>` is injected with
+  HTMLRewriter (also streaming). This keeps the HTTP data path off the DO and
+  enables SSE/large bodies. `AppHost.preview()` (buffered) still exists for the
+  assistant's `preview` tool ONLY.
+- **New capability files:** `capabilities/scoped-blob-store.ts` (R2, keyed by
+  `<instance>/<namespace>/`), `capabilities/scoped-fetcher.ts` (mediated egress,
+  method is `send` not `fetch` to avoid the WorkerEntrypoint collision). Both are
+  exported from `server.ts` and minted by the broker. R2 binding `BLOBS` is in
+  `wrangler.jsonc` (`r2_buckets`); after adding it, `npm run types` regenerates a
+  STRICTER d.ts (pins `ASSISTANT_MODEL` to a literal + retypes stubs) that breaks
+  `tsc` — the committed `worker-configuration.d.ts` is hand-kept with
+  `ASSISTANT_MODEL: string`; add new bindings by hand rather than clobbering it.
 - Local DO state persists in `.wrangler/` across dev restarts.

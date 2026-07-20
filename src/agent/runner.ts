@@ -51,6 +51,8 @@ const HOST_ENTRY = "__host_entry__.js";
  *   export const initialState = {...}  // or a function; optional
  *   export function view(state, ctx) { ... }                  // optional
  *   export const seats = ["X", "O"]                           // optional
+ *   export const stateVersion = 2                             // optional
+ *   export function migrate(oldState, oldStateVersion) { ... } // optional
  */
 function hostEntrySource(appEntry: string): string {
   const importPath = "./" + appEntry.replace(/^\.?\//, "");
@@ -65,6 +67,18 @@ function hostEntrySource(appEntry: string): string {
     "  if (typeof app[name] !== 'undefined') return app[name];",
     "  if (mod && typeof mod[name] !== 'undefined') return mod[name];",
     "  return undefined;",
+    "}",
+    "",
+    "// Heuristic shape check: does `state` carry every top-level key the app's",
+    "// initialState declares? Used by probe() when the app has no `view` to",
+    "// exercise. Opaque/primitive seeds are assumed compatible.",
+    "function shapeCompatible(init, state) {",
+    "  if (init === null || typeof init !== 'object') return true;",
+    "  if (state === null || typeof state !== 'object') return false;",
+    "  for (const k of Object.keys(init)) {",
+    "    if (!(k in state)) return false;",
+    "  }",
+    "  return true;",
     "}",
     "",
     "export class Logic extends WorkerEntrypoint {",
@@ -98,6 +112,34 @@ function hostEntrySource(appEntry: string): string {
     "    const list = typeof value === 'function' ? await value() : value;",
     "    if (!Array.isArray(list)) return { ok: false };",
     "    return { ok: true, seats: list.map(String) };",
+    "  }",
+    "  // Is `state` (persisted by an OLD code version) still usable by THIS",
+    "  // version? Exercises the new code against the old state WITHOUT mutating",
+    "  // it: prefer the pure `view` projection (a real read of the shape); else",
+    "  // fall back to a structural check against initialState. Any throw => not",
+    "  // compatible. Lets the coordinator KEEP an in-progress game across an edit.",
+    "  async probe(state) {",
+    "    try {",
+    "      const viewFn = pick('view');",
+    "      if (typeof viewFn === 'function') {",
+    "        await viewFn(state, { seat: null, playerId: null });",
+    "        return { ok: true, compatible: true };",
+    "      }",
+    "      const seed = pick('initialState');",
+    "      const init = typeof seed === 'function' ? await seed() : seed;",
+    "      return { ok: true, compatible: shapeCompatible(init, state) };",
+    "    } catch (e) {",
+    "      return { ok: true, compatible: false };",
+    "    }",
+    "  }",
+    "  // Optional forward-migration: transform state saved by an older version",
+    "  // into this version's shape. Returns { ok:false } when the app exports no",
+    "  // `migrate` (the coordinator then resets to initialState).",
+    "  async migrate(oldState, oldVersion) {",
+    "    const fn = pick('migrate');",
+    "    if (typeof fn !== 'function') return { ok: false, error: 'no-migrate' };",
+    "    const next = await fn(oldState, oldVersion);",
+    "    return { ok: next !== undefined, state: next };",
     "  }",
     "}",
     ""
@@ -165,25 +207,57 @@ export interface SeatsResult {
   seats?: string[];
 }
 
+/** RPC-serializable result of a compatibility probe (see coordinator #1). */
+export interface ProbeResult {
+  ok: boolean;
+  /** True when the probed state is usable by the current code version. */
+  compatible?: boolean;
+}
+
 /**
- * Bundle the app WITHOUT running it, to check that it compiles.
- * Throws with the build error message if the code is invalid (e.g. a syntax
- * error). Used to flag broken versions the moment they're saved, instead of
- * only when someone runs them.
+ * A bundled app, ready to hand straight to the Worker Loader. Produced once by
+ * `bundleApp` (on promote) and persisted, so the request path never has to
+ * re-run the bundler on a cold cache (see limitation #4 / AppHost build store).
+ */
+export interface Prebuilt {
+  mainModule: string;
+  modules: Record<string, string>;
+}
+
+/**
+ * Resolve the stored build for a content hash, if one was persisted on promote.
+ * `undefined` => no stored build; the runner falls back to bundling on demand.
+ */
+export type ResolvePrebuilt = (
+  hash: string
+) => Promise<Prebuilt | undefined> | Prebuilt | undefined;
+
+/** Content fingerprint of a file set (also the Worker Loader cache key + build key). */
+export { fingerprint };
+
+/**
+ * Bundle the app WITHOUT running it, to check that it compiles AND to capture
+ * the built modules for reuse. Throws with the build error message if the code
+ * is invalid (e.g. a syntax error). Used on promote to flag broken versions the
+ * moment they're saved and to persist the build so the run path skips esbuild.
  */
 export async function bundleApp(
   files: AppFile[],
   entrypoint: string
-): Promise<{ warnings: string[] }> {
-  const { warnings } = await createWorker({
+): Promise<Prebuilt & { warnings: string[] }> {
+  const { mainModule, modules, warnings } = await createWorker({
     files: withManifest(files, entrypoint),
     entryPoint: HOST_ENTRY,
     bundle: true
   });
-  return { warnings: warnings ?? [] };
+  return {
+    mainModule,
+    modules: modules as Record<string, string>,
+    warnings: warnings ?? []
+  };
 }
 
-/** Shared worker-code factory used by both runApp and reduce (one cache entry). */
+/** Shared worker-code factory used by every run path (one cache entry per hash). */
 function loadWorker(opts: {
   env: Env;
   instance: string;
@@ -191,19 +265,34 @@ function loadWorker(opts: {
   entrypoint: string;
   hash: string;
   collected: { warnings: string[] };
+  /** Resolve a persisted build for this hash (consulted ONLY on a cold cache). */
+  resolvePrebuilt?: ResolvePrebuilt;
 }) {
-  const { env, instance, files, entrypoint, hash, collected } = opts;
+  const { env, instance, files, entrypoint, hash, collected, resolvePrebuilt } = opts;
   const workerId = `app-${instance}-${hash}`;
   const worker = env.LOADER.get(workerId, async () => {
-    const { mainModule, modules, warnings } = await createWorker({
-      files: withManifest(files, entrypoint),
-      entryPoint: HOST_ENTRY,
-      bundle: true
-    });
-    collected.warnings = warnings ?? [];
+    // Cold cache only: use the persisted build if one exists (skips the
+    // bundler), else bundle on demand. Resolving the prebuilt is deferred to
+    // here so warm hits pay neither the lookup nor the bundler.
+    const prebuilt = resolvePrebuilt ? await resolvePrebuilt(hash) : undefined;
+    let mainModule: string;
+    let modules: Record<string, string>;
+    if (prebuilt) {
+      mainModule = prebuilt.mainModule;
+      modules = prebuilt.modules;
+    } else {
+      const built = await createWorker({
+        files: withManifest(files, entrypoint),
+        entryPoint: HOST_ENTRY,
+        bundle: true
+      });
+      mainModule = built.mainModule;
+      modules = built.modules as Record<string, string>;
+      collected.warnings = built.warnings ?? [];
+    }
     return {
       mainModule,
-      modules: modules as Record<string, string>,
+      modules,
       compatibilityDate: "2026-01-01",
       compatibilityFlags: ["nodejs_compat"],
       // The ONLY capability the untrusted app receives.
@@ -222,6 +311,33 @@ function loadWorker(opts: {
   return { worker, workerId };
 }
 
+/**
+ * Fingerprint the files, resolve any persisted build for that hash, and load the
+ * worker. The single place the run paths share so precompiled-build lookup and
+ * on-demand bundling both live in one spot.
+ */
+async function getWorker(opts: {
+  env: Env;
+  instance: string;
+  files: AppFile[];
+  entrypoint: string;
+  resolvePrebuilt?: ResolvePrebuilt;
+}): Promise<{ worker: ReturnType<typeof loadWorker>["worker"]; workerId: string; collected: { warnings: string[] } }> {
+  const { env, instance, files, entrypoint, resolvePrebuilt } = opts;
+  const hash = await fingerprint(files);
+  const collected: { warnings: string[] } = { warnings: [] };
+  const { worker, workerId } = loadWorker({
+    env,
+    instance,
+    files,
+    entrypoint,
+    hash,
+    collected,
+    resolvePrebuilt
+  });
+  return { worker, workerId, collected };
+}
+
 export async function runApp(opts: {
   env: Env;
   instance: string;
@@ -229,12 +345,17 @@ export async function runApp(opts: {
   files: AppFile[];
   entrypoint: string;
   request: Request;
+  resolvePrebuilt?: ResolvePrebuilt;
 }): Promise<RunResult> {
-  const { env, instance, version, files, entrypoint, request } = opts;
+  const { env, instance, version, files, entrypoint, request, resolvePrebuilt } = opts;
 
-  const hash = await fingerprint(files);
-  const collected: { warnings: string[] } = { warnings: [] };
-  const { worker, workerId } = loadWorker({ env, instance, files, entrypoint, hash, collected });
+  const { worker, workerId, collected } = await getWorker({
+    env,
+    instance,
+    files,
+    entrypoint,
+    resolvePrebuilt
+  });
 
   const entry = worker.getEntrypoint() as Fetcher;
   const response = await entry.fetch(request);
@@ -255,11 +376,10 @@ export async function reduce(opts: {
   state: unknown;
   action: unknown;
   ctx: unknown;
+  resolvePrebuilt?: ResolvePrebuilt;
 }): Promise<ReduceResult> {
-  const { env, instance, files, entrypoint, state, action, ctx } = opts;
-  const hash = await fingerprint(files);
-  const collected: { warnings: string[] } = { warnings: [] };
-  const { worker } = loadWorker({ env, instance, files, entrypoint, hash, collected });
+  const { env, instance, files, entrypoint, state, action, ctx, resolvePrebuilt } = opts;
+  const { worker } = await getWorker({ env, instance, files, entrypoint, resolvePrebuilt });
 
   const logic = worker.getEntrypoint("Logic") as unknown as {
     applyAction(state: unknown, action: unknown, ctx: unknown): Promise<ReduceResult>;
@@ -273,11 +393,10 @@ export async function initialState(opts: {
   instance: string;
   files: AppFile[];
   entrypoint: string;
+  resolvePrebuilt?: ResolvePrebuilt;
 }): Promise<ReduceResult> {
-  const { env, instance, files, entrypoint } = opts;
-  const hash = await fingerprint(files);
-  const collected: { warnings: string[] } = { warnings: [] };
-  const { worker } = loadWorker({ env, instance, files, entrypoint, hash, collected });
+  const { env, instance, files, entrypoint, resolvePrebuilt } = opts;
+  const { worker } = await getWorker({ env, instance, files, entrypoint, resolvePrebuilt });
 
   const logic = worker.getEntrypoint("Logic") as unknown as {
     initialState(): Promise<ReduceResult>;
@@ -300,11 +419,10 @@ export async function project(opts: {
   entrypoint: string;
   state: unknown;
   viewers: Viewer[];
+  resolvePrebuilt?: ResolvePrebuilt;
 }): Promise<ProjectResult> {
-  const { env, instance, files, entrypoint, state, viewers } = opts;
-  const hash = await fingerprint(files);
-  const collected: { warnings: string[] } = { warnings: [] };
-  const { worker } = loadWorker({ env, instance, files, entrypoint, hash, collected });
+  const { env, instance, files, entrypoint, state, viewers, resolvePrebuilt } = opts;
+  const { worker } = await getWorker({ env, instance, files, entrypoint, resolvePrebuilt });
 
   const logic = worker.getEntrypoint("Logic") as unknown as {
     views(state: unknown, viewers: Viewer[]): Promise<ProjectResult>;
@@ -323,11 +441,10 @@ export async function seats(opts: {
   instance: string;
   files: AppFile[];
   entrypoint: string;
+  resolvePrebuilt?: ResolvePrebuilt;
 }): Promise<SeatsResult> {
-  const { env, instance, files, entrypoint } = opts;
-  const hash = await fingerprint(files);
-  const collected: { warnings: string[] } = { warnings: [] };
-  const { worker } = loadWorker({ env, instance, files, entrypoint, hash, collected });
+  const { env, instance, files, entrypoint, resolvePrebuilt } = opts;
+  const { worker } = await getWorker({ env, instance, files, entrypoint, resolvePrebuilt });
 
   const logic = worker.getEntrypoint("Logic") as unknown as {
     seats(): Promise<SeatsResult>;
@@ -335,4 +452,51 @@ export async function seats(opts: {
   // `await` (not a bare return): keeps the loaded-worker stub alive until the
   // cross-worker RPC resolves.
   return await logic.seats();
+}
+
+/**
+ * Ask the CURRENT app version whether `state` (persisted by an older version)
+ * is still usable — see the state-preservation flow in the realtime
+ * coordinator. Returns `{ ok:true, compatible:false }` on any error inside the
+ * app so the caller can fall back to migrate/reset. Never throws for that.
+ */
+export async function probe(opts: {
+  env: Env;
+  instance: string;
+  files: AppFile[];
+  entrypoint: string;
+  state: unknown;
+  resolvePrebuilt?: ResolvePrebuilt;
+}): Promise<ProbeResult> {
+  const { env, instance, files, entrypoint, state, resolvePrebuilt } = opts;
+  const { worker } = await getWorker({ env, instance, files, entrypoint, resolvePrebuilt });
+
+  const logic = worker.getEntrypoint("Logic") as unknown as {
+    probe(state: unknown): Promise<ProbeResult>;
+  };
+  return await logic.probe(state);
+}
+
+/**
+ * Run the app's optional pure `migrate(oldState, oldVersion)` export to carry
+ * state forward across a breaking shape change. Returns
+ * `{ ok:false, error:"no-migrate" }` when the app exports none, in which case
+ * the coordinator resets to `initialState`. Never throws for a missing migrate.
+ */
+export async function migrate(opts: {
+  env: Env;
+  instance: string;
+  files: AppFile[];
+  entrypoint: string;
+  state: unknown;
+  version: number;
+  resolvePrebuilt?: ResolvePrebuilt;
+}): Promise<ReduceResult> {
+  const { env, instance, files, entrypoint, state, version, resolvePrebuilt } = opts;
+  const { worker } = await getWorker({ env, instance, files, entrypoint, resolvePrebuilt });
+
+  const logic = worker.getEntrypoint("Logic") as unknown as {
+    migrate(state: unknown, version: number): Promise<ReduceResult>;
+  };
+  return await logic.migrate(state, version);
 }

@@ -5,7 +5,10 @@ import {
   reduce,
   project,
   seats as appSeats,
-  initialState as appInitialState
+  initialState as appInitialState,
+  probe as appProbe,
+  migrate as appMigrate,
+  type ResolvePrebuilt
 } from "../agent/runner";
 
 /**
@@ -73,6 +76,8 @@ export interface RoomHost {
   /** Persistence in the reserved room scope (backed by app_data SQLite). */
   roomGet(key: string): string | null;
   roomPut(key: string, value: string): void;
+  /** Resolve a persisted build for a content hash (skips re-bundling). */
+  resolvePrebuilt: ResolvePrebuilt;
 }
 
 export class RoomCoordinator {
@@ -138,10 +143,7 @@ export class RoomCoordinator {
       const prev = this.#readState();
 
       const result = await reduce({
-        env: this.#host.env,
-        instance: this.#host.name,
-        files: this.#host.roomFiles(),
-        entrypoint: this.#host.roomEntrypoint(),
+        ...this.#runnerOpts(),
         state: prev,
         action: msg.action,
         ctx
@@ -207,9 +209,20 @@ export class RoomCoordinator {
   // ── state helpers ──
 
   /**
-   * Reset stored state to the app's initial state if the version changed, and
-   * (re)load the app-defined seat pool. Seat names are owned by the app, so they
-   * are refreshed whenever the live version changes (or were never loaded).
+   * Bring stored state in line with the live code version, and (re)load the
+   * app-defined seat pool. Seat names are owned by the app, so they are
+   * refreshed whenever the live version changes (or were never loaded).
+   *
+   * STATE PRESERVATION (see limitation #1): a code edit bumps the version, but
+   * that must NOT automatically wipe an in-progress game. When the version
+   * changes and we already hold state, we try to carry it forward, in order:
+   *   1. KEEP   — probe the old state against the new bundle; if compatible,
+   *               keep it (and the seats) as-is.
+   *   2. MIGRATE— else run the app's optional `migrate(old, oldVersion)` and
+   *               keep the result if IT probes compatible.
+   *   3. RESET  — else reseed from `initialState` and release seats (new game).
+   * A cosmetic/logic edit that doesn't touch the state shape therefore leaves
+   * the running game untouched.
    */
   async #ensureFreshState(): Promise<void> {
     const storedVersion = this.#host.roomGet(KEY_STATE_VERSION);
@@ -218,30 +231,81 @@ export class RoomCoordinator {
 
     // Refresh the seat pool from the app (the core declares no seat names).
     if (versionChanged || this.#host.roomGet(KEY_SEAT_NAMES) === null) {
-      const s = await appSeats({
-        env: this.#host.env,
-        instance: this.#host.name,
-        files: this.#host.roomFiles(),
-        entrypoint: this.#host.roomEntrypoint()
-      });
+      const s = await appSeats(this.#runnerOpts());
       this.#host.roomPut(KEY_SEAT_NAMES, JSON.stringify(s.ok ? s.seats : []));
     }
 
-    const hasState = this.#host.roomGet(KEY_STATE) !== null;
+    const rawState = this.#host.roomGet(KEY_STATE);
+    const hasState = rawState !== null;
+
+    // Already current — nothing to do.
     if (hasState && !versionChanged) return;
 
-    const seed = await appInitialState({
+    // First-ever init: seed from the app. Nothing to preserve, no seats to clear.
+    if (!hasState) {
+      await this.#seedInitialState(active);
+      return;
+    }
+
+    // Version changed with existing state: try to preserve it across the edit.
+    const oldState = JSON.parse(rawState) as unknown;
+    const preserved = await this.#preserveState(oldState, storedVersion);
+    if (preserved.kept) {
+      this.#host.roomPut(KEY_STATE, JSON.stringify(preserved.state ?? null));
+      this.#host.roomPut(KEY_STATE_VERSION, active);
+      return; // seats intact — the same game continues on the new code
+    }
+
+    // Incompatible and unmigratable → fresh game.
+    await this.#seedInitialState(active);
+    this.#writeSeats({});
+  }
+
+  /** Common runner args for this room's live app version. */
+  #runnerOpts() {
+    return {
       env: this.#host.env,
       instance: this.#host.name,
       files: this.#host.roomFiles(),
-      entrypoint: this.#host.roomEntrypoint()
-    });
+      entrypoint: this.#host.roomEntrypoint(),
+      resolvePrebuilt: this.#host.resolvePrebuilt
+    };
+  }
+
+  /** Seed stored state from the app's `initialState` for the given version. */
+  async #seedInitialState(active: string): Promise<void> {
+    const seed = await appInitialState(this.#runnerOpts());
     const value = seed.ok ? seed.state : null;
     this.#host.roomPut(KEY_STATE, JSON.stringify(value ?? null));
     this.#host.roomPut(KEY_STATE_VERSION, active);
-    // A change from one real version to another means a new game — clear seats.
-    // (Not on first-ever init, when there's nothing to clear.)
-    if (storedVersion !== null && versionChanged) this.#writeSeats({});
+  }
+
+  /**
+   * Try to carry `oldState` (saved by version `oldStoredVersion`) forward to the
+   * current code: KEEP if it probes compatible, else MIGRATE + re-probe. Returns
+   * `{ kept:false }` when neither works (caller resets to initialState).
+   */
+  async #preserveState(
+    oldState: unknown,
+    oldStoredVersion: string | null
+  ): Promise<{ kept: boolean; state?: unknown }> {
+    // 1. KEEP — is the old state directly usable by the new code?
+    const direct = await appProbe({ ...this.#runnerOpts(), state: oldState });
+    if (direct.ok && direct.compatible) return { kept: true, state: oldState };
+
+    // 2. MIGRATE — let the app transform it, and keep only if the result probes ok.
+    const migrated = await appMigrate({
+      ...this.#runnerOpts(),
+      state: oldState,
+      version: Number(oldStoredVersion ?? 0)
+    });
+    if (migrated.ok && migrated.state !== undefined) {
+      const check = await appProbe({ ...this.#runnerOpts(), state: migrated.state });
+      if (check.ok && check.compatible) return { kept: true, state: migrated.state };
+    }
+
+    // 3. Give up — caller reseeds.
+    return { kept: false };
   }
 
   #seatNames(): Seat[] {
@@ -296,10 +360,7 @@ export class RoomCoordinator {
       }));
 
       const result = await project({
-        env: this.#host.env,
-        instance: this.#host.name,
-        files: this.#host.roomFiles(),
-        entrypoint: this.#host.roomEntrypoint(),
+        ...this.#runnerOpts(),
         state,
         viewers
       });

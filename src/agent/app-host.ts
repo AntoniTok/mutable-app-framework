@@ -9,7 +9,8 @@ import {
   APP_STORAGE_FACET_WORKER_ID,
   type AppStorageFacetStub
 } from "./app-storage-facet";
-import { bundleApp, runApp } from "./runner";
+import { bundleApp, runApp, fingerprint } from "./runner";
+import type { StoredBuild } from "./schema";
 import { RoomCoordinator } from "../realtime/coordinator";
 import type { ConnState, RoomHost } from "../realtime/coordinator";
 import * as db from "./schema";
@@ -48,6 +49,15 @@ const DEFAULT_ENTRYPOINT = "src/index.js";
 
 /** Reserved app_data scope for the realtime engine's own state (see coordinator). */
 const ROOM_SCOPE = "__room__";
+
+/**
+ * Reserved app_data scope for the per-app egress allowlist (see ScopedFetcher).
+ * Held in TRUSTED storage: the untrusted app can read it (indirectly, when a
+ * fetch is checked) but can never write it — only the host `/api/egress` route
+ * or a template seed sets it.
+ */
+const EGRESS_SCOPE = "__egress__";
+const EGRESS_KEY = "allow";
 
 /**
  * Sentinel connection token for a READ-ONLY state subscriber (the editor chrome
@@ -103,6 +113,12 @@ export class AppHost extends Agent<Env, HostState> {
     if (!db.hasAnyVersion(this)) {
       const template = getTemplate(props?.template ?? this.state.templateId);
       const version = db.insertVersion(this, template.files, `seed:${template.id}`);
+      // Precompile the seed so the very first request runs warm (limitation #4).
+      await this.#storeBuild(template.files);
+      // Seed the egress allowlist from the template (empty => no egress).
+      if (template.egress && template.egress.length > 0) {
+        db.appDataPut(this, EGRESS_SCOPE, EGRESS_KEY, JSON.stringify(template.egress));
+      }
       this.setState({
         ...this.state,
         activeVersion: version,
@@ -150,7 +166,8 @@ export class AppHost extends Agent<Env, HostState> {
         version: this.state.activeVersion,
         files,
         entrypoint: this.entrypoint(),
-        request
+        request,
+        resolvePrebuilt: this.resolvePrebuilt
       });
       return {
         status: response.status,
@@ -204,7 +221,8 @@ export class AppHost extends Agent<Env, HostState> {
           (c) => c.state?.token !== SPECTATOR_TOKEN
         ),
       roomGet: (k) => db.appDataGet(this, ROOM_SCOPE, k),
-      roomPut: (k, v) => db.appDataPut(this, ROOM_SCOPE, k, v)
+      roomPut: (k, v) => db.appDataPut(this, ROOM_SCOPE, k, v),
+      resolvePrebuilt: this.resolvePrebuilt
     };
   }
 
@@ -244,6 +262,26 @@ export class AppHost extends Agent<Env, HostState> {
     return this.currentFilesSync();
   }
 
+  /**
+   * The minimal code needed to RUN the live app: its files, entry, and version.
+   * The host worker calls this, then runs the app itself (streaming the
+   * response) — so the app's HTTP data path no longer flows through this DO.
+   * See server.ts handlePreview.
+   */
+  async getRunManifest(): Promise<{ files: AppFile[]; entrypoint: string; version: number }> {
+    return {
+      files: this.currentFilesSync(),
+      entrypoint: this.entrypoint(),
+      version: this.state.activeVersion
+    };
+  }
+
+  /** Look up a persisted build by content hash (used as the runner's cold-cache
+   *  prebuilt resolver from the host worker). */
+  async getBuild(hash: string): Promise<StoredBuild | undefined> {
+    return db.getBuild(this, hash);
+  }
+
   async getStatus(): Promise<HostState> {
     return this.state;
   }
@@ -273,9 +311,12 @@ export class AppHost extends Agent<Env, HostState> {
     // Save first, unconditionally, so the version exists regardless of outcome.
     const version = db.insertVersion(this, files, note);
 
-    // Validate by building. Only promote to live if the build succeeds.
+    // Validate by building. Only promote to live if the build succeeds. On
+    // success we persist the build (keyed by content hash) so the request path
+    // never re-runs the bundler on a cold cache (limitation #4).
     try {
-      await bundleApp(files, this.entrypoint());
+      const built = await bundleApp(files, this.entrypoint());
+      db.putBuild(this, await fingerprint(files), built.mainModule, built.modules);
       const previousVersion = this.state.activeVersion;
       this.setState({
         ...this.state,
@@ -355,7 +396,31 @@ export class AppHost extends Agent<Env, HostState> {
    */
   gcVersions(): void {
     db.pruneVersions(this, VERSION_HISTORY_KEEP, this.state.activeVersion);
+    // Keep the build cache bounded alongside version history.
+    db.pruneBuilds(this, VERSION_HISTORY_KEEP);
   }
+
+  /**
+   * Bundle `files` and persist the result keyed by content hash, so a later run
+   * (even after hibernation, when the Worker Loader cache is cold) can load the
+   * modules directly instead of re-running esbuild. Best-effort: a build failure
+   * is swallowed here (setFiles is the path that surfaces build errors).
+   */
+  async #storeBuild(files: AppFile[]): Promise<void> {
+    try {
+      const built = await bundleApp(files, this.entrypoint());
+      db.putBuild(this, await fingerprint(files), built.mainModule, built.modules);
+    } catch {
+      // Ignore — the on-demand bundler in the runner is the fallback.
+    }
+  }
+
+  /**
+   * Resolve a persisted build for a content hash (passed to the runner so it can
+   * skip bundling). An arrow property so it can be handed off as a callback
+   * without losing `this`.
+   */
+  resolvePrebuilt = (hash: string): StoredBuild | undefined => db.getBuild(this, hash);
 
   /** Try to build the live version; set status to ready or error accordingly. */
   private async validateActive(): Promise<void> {
@@ -366,6 +431,24 @@ export class AppHost extends Agent<Env, HostState> {
       const message = err instanceof Error ? err.message : String(err);
       this.setState({ ...this.state, status: "error", lastError: message });
     }
+  }
+
+  // ── egress allowlist (trusted policy; read by ScopedFetcher, written only
+  //    by the host /api/egress route) ──
+
+  /** The hosts this app may reach via `env.SYSTEM.requestFetch()`. */
+  async getEgressAllowlist(): Promise<string[]> {
+    const raw = db.appDataGet(this, EGRESS_SCOPE, EGRESS_KEY);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  }
+
+  /** Replace the app's egress allowlist (host-only; not reachable by the app). */
+  async setEgressAllowlist(list: string[]): Promise<string[]> {
+    const clean = Array.isArray(list)
+      ? list.map((s) => String(s).trim().toLowerCase()).filter((s) => s.length > 0)
+      : [];
+    db.appDataPut(this, EGRESS_SCOPE, EGRESS_KEY, JSON.stringify(clean));
+    return clean;
   }
 
   // ── app runtime data (invoked by the ScopedStore / ScopedFilesystem
@@ -416,6 +499,17 @@ export class AppHost extends Agent<Env, HostState> {
   }
   async storeList(scope: string): Promise<string[]> {
     return this.#appData().storeList(scope);
+  }
+  async storeIncr(scope: string, key: string, delta: number): Promise<number> {
+    return this.#appData().storeIncr(scope, key, delta);
+  }
+  async storeCas(
+    scope: string,
+    key: string,
+    expected: string | null,
+    next: string
+  ): Promise<boolean> {
+    return this.#appData().storeCas(scope, key, expected, next);
   }
 
   // filesystem (dofs runs inside the facet; these just forward)

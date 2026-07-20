@@ -1,6 +1,8 @@
 import { WorkerEntrypoint, exports } from "cloudflare:workers";
 import type { Env } from "../types";
+import type { ScopedBlobStore, ScopedBlobStoreProps } from "./scoped-blob-store";
 import type { ScopedFilesystem, ScopedFilesystemProps } from "./scoped-filesystem";
+import type { ScopedFetcher, ScopedFetcherProps } from "./scoped-fetcher";
 import type { ScopedStore, ScopedStoreProps } from "./scoped-store";
 
 /**
@@ -23,6 +25,8 @@ export type CapabilityBrokerProps = {
 type LoaderExports = {
   ScopedStore(options: { props: ScopedStoreProps }): ScopedStore;
   ScopedFilesystem(options: { props: ScopedFilesystemProps }): ScopedFilesystem;
+  ScopedBlobStore(options: { props: ScopedBlobStoreProps }): ScopedBlobStore;
+  ScopedFetcher(options: { props: ScopedFetcherProps }): ScopedFetcher;
 };
 const runtimeExports = exports as unknown as LoaderExports;
 
@@ -66,15 +70,37 @@ export class CapabilityBroker extends WorkerEntrypoint<
     });
   }
 
-  // ── RESERVED GROWTH HOOKS (documented, intentionally not implemented) ──
-  //
-  // Adding a resource type = bind it to the host in wrangler.jsonc + implement
-  // one method here. The app contract and runner stay unchanged.
-  //
-  // async requestBlobStore(namespace: string) {
-  //   // Backed by R2. Returns a BlobStore capability for large files
-  //   // (e.g. profile pictures). Requires an R2 binding on the host.
-  // }
+  /**
+   * Grant a private BLOB store (large binary objects) backed by R2. For images,
+   * audio, exports — anything too big for the 256 KiB filesystem cap. Keys are
+   * confined to a per-app, per-namespace prefix.
+   */
+  async requestBlobStore(namespace: string): Promise<ScopedBlobStore> {
+    if (!NAME_RE.test(namespace)) {
+      throw new Error(
+        `Invalid blob namespace: "${namespace}". Use letters, digits, "-" or "_".`
+      );
+    }
+    return runtimeExports.ScopedBlobStore({
+      props: { instance: this.ctx.props.instance, namespace }
+    });
+  }
+
+  /**
+   * Grant a MEDIATED outbound fetch capability. The app sandbox itself keeps
+   * `globalOutbound: null` (no direct egress); this capability performs the
+   * request in trusted host code, but ONLY to hosts on the app's per-app
+   * allowlist (held in trusted storage, not settable by the app). Requests to
+   * any other host are rejected. This is how an app reaches the outside world
+   * without ever being handed raw network access.
+   */
+  async requestFetch(): Promise<ScopedFetcher> {
+    return runtimeExports.ScopedFetcher({
+      props: { instance: this.ctx.props.instance }
+    });
+  }
+
+  // ── RESERVED GROWTH HOOK (documented, intentionally not implemented) ──
   //
   // async requestRoom() {
   //   // Backed by the realtime coordinator. Returns a Room capability

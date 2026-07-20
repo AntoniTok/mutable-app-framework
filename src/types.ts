@@ -8,6 +8,8 @@ export interface Env {
   CodeAssistant: DurableObjectNamespace<CodeAssistant>;
   LOADER: WorkerLoader;
   AI: Ai;
+  /** R2 bucket backing the app blob-store capability (broker.requestBlobStore). */
+  BLOBS: R2Bucket;
   /** Optional model override for the AI author (one-shot line-edit path). */
   AUTHOR_MODEL?: string;
   /** Optional overall timeout (ms) for one AI edit. Default 120000. */
@@ -28,6 +30,26 @@ export interface AppDataStore {
   storePut(scope: string, key: string, value: string): Promise<void>;
   storeDelete(scope: string, key: string): Promise<void>;
   storeList(scope: string): Promise<string[]>;
+  /**
+   * Atomic read-modify-write primitives. Each is a SINGLE facet method, so it
+   * runs to completion under the facet DO's input gate — no lost updates even
+   * under concurrent HTTP requests (see limitation #2).
+   */
+  storeIncr(scope: string, key: string, delta: number): Promise<number>;
+  storeCas(
+    scope: string,
+    key: string,
+    expected: string | null,
+    next: string
+  ): Promise<boolean>;
+}
+
+/**
+ * The subset of AppHost the ScopedFetcher capability calls back into: reading
+ * the per-app egress allowlist (trusted storage, never settable by the app).
+ */
+export interface AppEgressPolicy {
+  getEgressAllowlist(): Promise<string[]>;
 }
 
 /** A node kind on the app filesystem. */

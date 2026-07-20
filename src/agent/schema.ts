@@ -41,6 +41,57 @@ export function createTables(agent: SqlAgent): void {
     v TEXT NOT NULL,
     PRIMARY KEY (scope, k)
   )`;
+  // Precompiled build cache (limitation #4): the bundler output for a given
+  // file-content hash, captured on promote so the request path never re-runs
+  // esbuild on a cold Worker Loader cache. `modules` is a JSON object of
+  // path -> source. Keyed by hash (not version) since identical code shares one.
+  agent.sql`CREATE TABLE IF NOT EXISTS builds (
+    hash TEXT PRIMARY KEY,
+    main TEXT NOT NULL,
+    modules TEXT NOT NULL,
+    ts INTEGER NOT NULL
+  )`;
+}
+
+export interface StoredBuild {
+  mainModule: string;
+  modules: Record<string, string>;
+}
+
+/** Fetch a persisted build by content hash, or undefined if none is stored. */
+export function getBuild(agent: SqlAgent, hash: string): StoredBuild | undefined {
+  const [row] = agent.sql<{ main: string; modules: string }>`
+    SELECT main, modules FROM builds WHERE hash = ${hash}`;
+  if (!row) return undefined;
+  return {
+    mainModule: row.main,
+    modules: JSON.parse(row.modules) as Record<string, string>
+  };
+}
+
+/** Persist a build for a content hash (idempotent; overwrites on conflict). */
+export function putBuild(
+  agent: SqlAgent,
+  hash: string,
+  mainModule: string,
+  modules: Record<string, string>
+): void {
+  agent.sql`INSERT INTO builds (hash, main, modules, ts)
+    VALUES (${hash}, ${mainModule}, ${JSON.stringify(modules)}, ${Date.now()})
+    ON CONFLICT (hash) DO UPDATE SET main = excluded.main, modules = excluded.modules, ts = excluded.ts`;
+}
+
+/** Prune old builds so the cache can't grow without bound. Keeps the newest `keep`. */
+export function pruneBuilds(agent: SqlAgent, keep: number): number {
+  const recent = agent.sql<{ hash: string }>`
+    SELECT hash FROM builds ORDER BY ts DESC LIMIT ${Math.max(1, keep)}`;
+  const keepHashes = new Set<string>(recent.map((r) => r.hash));
+  const all = agent.sql<{ hash: string }>`SELECT hash FROM builds`;
+  const doomed = all.map((r) => r.hash).filter((h) => !keepHashes.has(h));
+  for (const h of doomed) {
+    agent.sql`DELETE FROM builds WHERE hash = ${h}`;
+  }
+  return doomed.length;
 }
 
 /** Insert a new version + its files. Returns the new version id. */

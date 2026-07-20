@@ -33,6 +33,11 @@
   // Workers AI: used by the host-side AI author to rewrite app code.
   "ai": { "binding": "AI" },
 
+  // R2: backs the app blob-store capability (broker.requestBlobStore) for large
+  // binary objects — images, audio, exports — that exceed the 256 KiB fs cap.
+  // Local `wrangler dev` simulates this without creating a real bucket.
+  "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "mutable-app-blobs" }],
+
   // Model for the Think-based coding assistant. Must be a reliable tool-caller;
   // kimi-k2.7-code is a frontier-scale (1T-param) agentic coding model with a
   // 262k context window, multi-turn tool calling and structured outputs — the

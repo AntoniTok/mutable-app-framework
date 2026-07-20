@@ -45,10 +45,11 @@ Three layers, two of them swappable:
 The app's code may be AI-written, so it runs in a **Dynamic Worker** with:
 
 - **only one capability**: a `SYSTEM` broker it must *ask* for resources, and
-- **no network egress** (`globalOutbound: null`).
+- **no direct network egress** (`globalOutbound: null`).
 
-It cannot touch storage, secrets, or the internet directly. This is
-capability-based security (Cap'n Web / Workers RPC).
+It cannot touch storage, secrets, or the internet directly — the only way out is
+a broker-**mediated** fetch (`requestFetch`), restricted to a per-app host
+allowlist. This is capability-based security (Cap'n Web / Workers RPC).
 
 ---
 
@@ -117,19 +118,23 @@ change promotes a new live version, **every connected client auto-reloads** too
 ```
 src/
   server.ts                    Entry Worker. Routes /api/*, /preview/*, /agents/*.
-  types.ts                     Env bindings + AppDataStore / AppFsStore RPC interfaces.
+  types.ts                     Env bindings (incl. BLOBS/R2) + AppDataStore
+                               (store incl. atomic incr/cas) / AppFsStore /
+                               AppEgressPolicy RPC interfaces.
 
   agent/
     app-host.ts                THE AGENT (Durable Object): stores/versions CODE,
                                runs it, setFiles / rollback / reset / preview.
                                store*/fs* RPC methods forward to the facet.
-    schema.ts                  AppHost SQLite tables (files, versions; app_data
-                               now holds ONLY the realtime __room__ scope) + helpers.
+    schema.ts                  AppHost SQLite tables (files, versions, builds
+                               [precompiled bundles]; app_data holds the realtime
+                               __room__ + __egress__ scopes) + helpers.
     runner.ts                  Bundles live code + runs it in a Dynamic Worker
                                (SYSTEM only, no egress, content-hash cached,
-                               DynamicWorkerTail attached). runApp() serves fetch;
-                               reduce()/initialState() call the app's pure reducer
-                               via an injected adapter entrypoint (one bundle).
+                               DynamicWorkerTail attached; uses persisted builds on
+                               a cold cache). runApp() serves fetch;
+                               reduce()/initialState()/probe()/migrate() call the
+                               app's pure exports via an injected adapter (one bundle).
     facet/
       entry.ts                 AppStorageFacet: the app's runtime data (key/value
                                store + dofs filesystem) in its OWN isolated SQLite,
@@ -146,12 +151,17 @@ src/
 
   capabilities/
     broker.ts                  The gatekeeper (env.SYSTEM). requestStore() +
-                               requestFilesystem() active; requestBlobStore /
-                               requestRoom reserved.
+                               requestFilesystem() + requestBlobStore() +
+                               requestFetch() active; requestRoom reserved.
     scoped-store.ts            Per-app key/value store (mediated here; backed by
-                               the facet via AppHost).
+                               the facet via AppHost). Includes ATOMIC incr()/cas()
+                               and JSON putJSON()/getJSON() helpers.
     scoped-filesystem.ts       Per-app filesystem (namespace-scoped, path-sanitised;
                                dofs runs in the facet, reached via AppHost).
+    scoped-blob-store.ts       Per-app R2-backed BLOB store for large binaries
+                               (key-prefixed per instance/namespace).
+    scoped-fetcher.ts          Mediated outbound fetch (send()): app stays egress-
+                               null; only allowlisted hosts are reachable.
 
   assistant/
     code-assistant.ts          THE AI CODING ASSISTANT: a separate Durable Object
@@ -194,9 +204,11 @@ public/
                                at /room.html?room=<id>.
 
 wrangler.jsonc                 Bindings: AppHost + CodeAssistant DOs, LOADER, AI,
-                               static assets, ASSISTANT_MODEL var, observability
-                               (head_sampling_rate: 1 for the tail worker).
-worker-configuration.d.ts      Generated binding/runtime types (npm run types).
+                               BLOBS (R2), static assets, ASSISTANT_MODEL var,
+                               observability (head_sampling_rate: 1 for the tail).
+worker-configuration.d.ts      Generated binding/runtime types. NOTE: `npm run
+                               types` regenerates a stricter d.ts that breaks tsc;
+                               the committed copy is hand-kept (add bindings by hand).
 
 scripts/
   build-facet.mjs              esbuild step: bundles the facet (+ tree-shaken
@@ -216,15 +228,19 @@ vendor/
 
 **Run the app**
 ```
-Browser → server.ts (/preview/*) → AppHost.preview()
-        → runner.runApp(): bundle live files → LOADER.get(hash) (isolated worker)
+Browser → server.ts (/preview/*) → AppHost.getRunManifest()  (fetch CODE only)
+        → runner.runApp() IN THE HOST WORKER (not the DO, so the response can
+          STREAM): LOADER.get(hash) → isolated worker. On a COLD cache the
+          precompiled build (persisted on promote) is used; else it bundles.
             env = { SYSTEM: broker },  globalOutbound = null,  tails = [tail]
         → app.fetch() runs; may call env.SYSTEM.requestStore() → ScopedStore
             → AppHost forwards into the app-data FACET (its own isolated SQLite)
-        → response returned; HTML gets <base href="/preview/"> injected so the
-          app's relative links/buttons work inside the preview.
+        → response STREAMED back; HTML gets <base href="/preview/"> injected via
+          HTMLRewriter (also streaming) so relative links/buttons work.
         → after the run, DynamicWorkerTail ships the app's logs to Workers Logs.
 ```
+(The assistant's `preview` tool still uses `AppHost.preview()`, which buffers +
+truncates — only the user-facing `/preview/*` path streams.)
 
 **Change the app (AI — the assistant)**
 ```
@@ -262,17 +278,24 @@ live mutable state — so they live in **separate** SQLite databases.
 
 - `files(version, path, content)` — the source code, one row per file per version.
 - `versions(id, ts, note)` — the history list (enables rollback).
-- `app_data(scope, k, v)` — now ONLY the realtime engine's `__room__` state (the
-  coordinator's own state, not app data).
+- `builds(hash, main, modules, ts)` — the precompiled bundler output per content
+  hash, persisted on promote so the run path skips esbuild on a cold cache
+  (pruned alongside version history).
+- `app_data(scope, k, v)` — the realtime engine's `__room__` state (the
+  coordinator's own state) AND the reserved `__egress__` allowlist. Not app data.
 
 **The facet's isolated SQLite** (`AppStorageFacet`, a child DO) holds the app's
 RUNTIME DATA, reached via the broker and forwarded by AppHost:
 
-- `app_data(scope, k, v)` — the app's key/value store (broker `requestStore`).
+- `app_data(scope, k, v)` — the app's key/value store (broker `requestStore`),
+  including the atomic `incr`/`cas` primitives.
 - `vfs_*` — the app's private **filesystem** (broker `requestFilesystem`), managed
   by `@cloudflare/dofs` (bundled into the facet). A real POSIX-ish filesystem
   (folders, `stat`, `grep`, `find`) for small structured data (files capped at
   256 KiB), not large blobs.
+
+Large binaries live in **R2** (broker `requestBlobStore`), keyed by an
+`<instance>/<namespace>/` prefix — not in either SQLite.
 
 The facet has its own database (AppHost can't read it) and its own input gate, so
 a chatty app can't bloat version history or contend with the realtime coordinator.
@@ -296,8 +319,8 @@ Defined in `src/templates/types.ts`. An app's files must:
 - Provide a default export with `async fetch(request, env)`.
 - Serve a real HTML page at `/` (content-type `text/html`) with the UI, and put
   actions behind data endpoints that return JSON.
-- Persist ONLY via `env.SYSTEM`. Two storage capabilities are available today —
-  pick the one that fits the data; don't mirror the same data into both.
+- Persist ONLY via `env.SYSTEM`. Pick the capability that fits the data; don't
+  mirror the same data into two.
 
   A flat **key/value store** (`requestStore`) — best for counters and flat values:
   ```js
@@ -306,6 +329,11 @@ Defined in `src/templates/types.ts`. An app's files must:
   const v = await store.get(key);     // string | null
   await store.list();                 // string[]
   await store.delete(key);
+  // ATOMIC (safe under concurrent requests — a get()+put() pair is NOT):
+  const n = await store.incr("count", 1);         // -> new number
+  const ok = await store.cas("count", "1", "2");  // true if swapped
+  // JSON convenience (same store, serialized for you):
+  await store.putJSON("cfg", { a: 1 }); const c = await store.getJSON("cfg");
   ```
 
   A private **filesystem** (`requestFilesystem`) — best for structured data with
@@ -323,7 +351,23 @@ Defined in `src/templates/types.ts`. An app's files must:
   ```
   Paths are namespace-relative (no leading `/`, no `..`); missing files read as
   `null`. Path sanitisation lives in the trusted `ScopedFilesystem`, not the app.
-- Make **no** external network calls (egress is blocked).
+
+  A **blob store** (`requestBlobStore`) — R2-backed, for LARGE binaries (images,
+  audio, exports) that exceed the 256 KiB filesystem cap:
+  ```js
+  const blobs = await env.SYSTEM.requestBlobStore("uploads");
+  await blobs.put("pic.png", bytes);   // ArrayBuffer | string
+  const buf = await blobs.get("pic.png");   // ArrayBuffer | null
+  await blobs.delete("pic.png");  await blobs.list();  // string[]
+  ```
+- No **direct** network egress. The app sandbox stays `globalOutbound: null`; the
+  only way out is a **mediated fetch**, and only to hosts on the app's per-app
+  allowlist (managed via `POST /api/egress`, never by the app itself):
+  ```js
+  const net = await env.SYSTEM.requestFetch();
+  const res = await net.send("https://api.example.com/x", { method: "GET" });
+  // res = { status, statusText, headers: [k,v][], body: ArrayBuffer }
+  ```
 - Use **relative** URLs in HTML (`fetch("inc")`, not `/inc`) — the app is
   previewed under `/preview/`.
 
@@ -379,12 +423,13 @@ var) — low under-plans and invites lazy refusals, high burns tokens.
 The **broker is the growth point**. Adding a resource type is additive:
 
 1. Bind the resource to the host in `wrangler.jsonc` (if it needs a binding).
-2. Add one `request*` method to `CapabilityBroker` (see reserved
-   `requestBlobStore` / `requestRoom` hooks) that returns a scoped capability
-   stub, prefixed by `props.instance` for isolation.
+2. Add one `request*` method to `CapabilityBroker` that returns a scoped
+   capability stub, prefixed by `props.instance` for isolation. `requestBlobStore`
+   (R2) and `requestFetch` (mediated egress) are shipped examples;
+   `requestRoom` remains the one reserved hook.
 
 The app contract and runner don't change — apps just call
-`env.SYSTEM.requestBlobStore(...)`.
+`env.SYSTEM.requestBlobStore(...)` / `env.SYSTEM.requestFetch(...)`.
 
 The **filesystem capability** (`requestFilesystem` → `ScopedFilesystem`) is a
 real, shipped instance of exactly this pattern: it mirrors the
@@ -527,8 +572,14 @@ added later as a second consumer of this same engine, without changing the
 pure-reducer apps.
 
 Realtime state lives in the AppHost's `app_data` table under a reserved
-`__room__` scope (not in the synced pointer state), and is reset to
-`initialState` automatically when the app's live version changes.
+`__room__` scope (not in the synced pointer state). When the app's live version
+changes, the state is **preserved across the edit** rather than wiped: the
+coordinator KEEPS the stored state if it still probes compatible with the new
+code, else runs the app's optional pure `migrate(oldState, oldStateVersion)` and
+keeps that if IT probes compatible, and only otherwise resets to `initialState`
+(clearing seats). So a cosmetic/logic edit no longer resets an in-progress game;
+a breaking state-shape change either migrates or resets. (See the state-
+preservation flow in `src/realtime/coordinator.ts` `#ensureFreshState`.)
 
 ---
 
@@ -542,7 +593,9 @@ Realtime state lives in the AppHost's `app_data` table under a reserved
 | `POST /api/files` | `{ files, note? }` | `{ version }` |
 | `POST /api/reset` | — | `{ version }` |
 | `POST /api/rollback` | `{ version }` | `{ ok: true }` |
-| `ANY /preview/<path>` | — | the app's response (HTML gets `<base>` injected) |
+| `GET /api/egress` | — | `{ allow: string[] }` (the app's egress allowlist) |
+| `POST /api/egress` | `{ allow }` | `{ allow }` (host allowlist for `requestFetch`) |
+| `ANY /preview/<path>` | — | the app's response, **streamed** (HTML gets `<base>` injected) |
 | `WS /agents/app-host/<room>` | — | realtime channel for multiplayer apps (see Multiplayer) |
 | `WS /agents/code-assistant/<room>` | — | AI coding assistant chat (Agents `cf_agent_chat_*` protocol) |
 
@@ -569,8 +622,10 @@ version history and realtime state). The default room is `main`.
 - **The AI assistant is `@cloudflare/think` (EXPERIMENTAL).** It runs as a
   separate per-room Durable Object (`CodeAssistant`) and drives an agentic loop
   over host-side tools. It's a heavy dependency (`ai` v6 — NOT v7 — `zod` v4,
-  `@cloudflare/shell`, codemode, just-bash; ~5 MB gzip bundle — this dominates the
-  host worker). We install the minimal set: no React / `@cloudflare/ai-chat` (the
+  `@cloudflare/shell`, codemode, just-bash; measured ~1.46 MB gzip for the whole
+  host worker — well under the 3 MB Free / 10 MB paid limits, so size is NOT a
+  ceiling risk; Think dominates the bundle's composition + cold-start parse, not
+  the limit). We install the minimal set: no React / `@cloudflare/ai-chat` (the
   Chat panel is vanilla JS), and Think's workspace/bash/code-execution tools are
   gated off. `Think`'s peer `agents >=0.17.1` is satisfied by the pinned `0.17.3`.
 - **Code Mode (`@cloudflare/codemode`).** The assistant also has a `code_mode`

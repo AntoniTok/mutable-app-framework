@@ -1,6 +1,7 @@
 import { getAgentByName, routeAgentRequest } from "agents";
 import type { Env } from "./types";
 import type { AppHost } from "./agent/app-host";
+import { runApp } from "./agent/runner";
 
 // The Agent + capability entrypoints must be exported from the main module so
 // the runtime can instantiate them (DO) and mint stubs (WorkerEntrypoint).
@@ -9,6 +10,8 @@ export { CodeAssistant } from "./assistant/code-assistant";
 export { CapabilityBroker } from "./capabilities/broker";
 export { ScopedStore } from "./capabilities/scoped-store";
 export { ScopedFilesystem } from "./capabilities/scoped-filesystem";
+export { ScopedBlobStore } from "./capabilities/scoped-blob-store";
+export { ScopedFetcher } from "./capabilities/scoped-fetcher";
 // Tail Worker: captures logs/exceptions/outcome from the untrusted app's
 // Dynamic Worker runs into Workers Logs (attached in src/agent/runner.ts).
 export { DynamicWorkerTail } from "./observability/dynamic-worker-tail";
@@ -74,6 +77,16 @@ async function handleApi(
       await agent.rollback(body.version);
       return json({ ok: true });
     }
+    if (path === "/api/egress" && request.method === "GET") {
+      return json({ allow: await agent.getEgressAllowlist() });
+    }
+    if (path === "/api/egress" && request.method === "POST") {
+      const body = (await request.json()) as { allow?: unknown };
+      if (!Array.isArray(body.allow))
+        return errorResponse("allow[] (string hostnames) required", 400);
+      const allow = await agent.setEgressAllowlist(body.allow as string[]);
+      return json({ allow });
+    }
     return errorResponse("Not found", 404);
   } catch (err) {
     return errorResponse(err);
@@ -87,50 +100,63 @@ async function handlePreview(request: Request, env: Env): Promise<Response> {
   const appUrl = new URL(request.url);
   appUrl.pathname = appPath;
 
-  const hasBody = request.method !== "GET" && request.method !== "HEAD";
-  const agent = await getAgentByName<Env, AppHost>(env.AppHost, roomOf(url));
+  const room = roomOf(url);
+  const agent = await getAgentByName<Env, AppHost>(env.AppHost, room);
   try {
-    const result = await agent.preview({
-      url: appUrl.toString(),
-      method: request.method,
-      headers: [...request.headers.entries()],
-      body: hasBody ? await request.text() : null
-    });
-
-    const contentType =
-      result.headers.find(([k]) => k.toLowerCase() === "content-type")?.[1] ?? "";
-
-    // The app's response headers are forwarded, but two must never be copied
-    // verbatim: content-length would be wrong the moment we touch the body, and
-    // content-encoding would mislabel a body we've decoded. Strip both and let
-    // the runtime recompute an accurate content-length.
-    let bodyRewritten = false;
-    let body: BodyInit = result.body;
-
-    // Only text/html is decoded and rewritten; everything else (JSON, images,
-    // downloads, ...) passes through as raw bytes, uncorrupted.
-    if (contentType.includes("text/html")) {
-      let html = new TextDecoder().decode(result.body);
-      // Inject <base href="/preview/"> so the app's relative links/fetches
-      // resolve back under the preview prefix (so in-page buttons work).
-      if (!/<base\s/i.test(html)) {
-        const baseTag = '<base href="/preview/">';
-        html = /<head[^>]*>/i.test(html)
-          ? html.replace(/<head[^>]*>/i, (m) => `${m}${baseTag}`)
-          : `${baseTag}${html}`;
-      }
-      body = html;
-      bodyRewritten = true;
+    // Fetch only the CODE from the DO, then run the app HERE in the host worker.
+    // Running out-of-DO lets us STREAM the app's response straight to the client
+    // (SSE, large bodies) instead of buffering it through an RPC ArrayBuffer, and
+    // keeps the app's HTTP data path off the single-threaded DO. Storage
+    // capabilities still call back into the DO/facet, mediated by the broker.
+    const manifest = await agent.getRunManifest();
+    if (manifest.files.length === 0) {
+      return new Response("No app code yet.", {
+        status: 503,
+        headers: { "content-type": "text/plain" }
+      });
     }
 
-    const headers = new Headers(result.headers);
-    headers.delete("content-length");
-    if (bodyRewritten) headers.delete("content-encoding");
+    const hasBody = request.method !== "GET" && request.method !== "HEAD";
+    const appRequest = new Request(appUrl.toString(), {
+      method: request.method,
+      headers: request.headers,
+      body: hasBody ? request.body : undefined,
+      // Required when forwarding a streaming request body in Workers.
+      ...(hasBody ? { duplex: "half" } : {})
+    } as RequestInit);
 
-    return new Response(body, {
-      status: result.status,
-      headers
+    const { response } = await runApp({
+      env,
+      instance: room,
+      version: manifest.version,
+      files: manifest.files,
+      entrypoint: manifest.entrypoint,
+      request: appRequest,
+      // Cold-cache only: reuse the build persisted on promote (limitation #4).
+      resolvePrebuilt: (hash) => agent.getBuild(hash)
     });
+
+    const contentType = response.headers.get("content-type") ?? "";
+    const headers = new Headers(response.headers);
+    // content-length would be wrong once we rewrite HTML; let the runtime set it.
+    headers.delete("content-length");
+
+    // text/html: inject <base href="/preview/"> so the app's relative links and
+    // fetches resolve under the preview prefix — STREAMING, via HTMLRewriter, so
+    // we never buffer the page. Everything else streams through untouched.
+    if (contentType.includes("text/html")) {
+      headers.delete("content-encoding");
+      const rewritten = new HTMLRewriter()
+        .on("head", {
+          element(el) {
+            el.prepend('<base href="/preview/">', { html: true });
+          }
+        })
+        .transform(new Response(response.body, { status: response.status, headers }));
+      return rewritten;
+    }
+
+    return new Response(response.body, { status: response.status, headers });
   } catch (err) {
     return errorResponse(err);
   }
