@@ -27,8 +27,10 @@ import type { AppTemplate } from "../types";
  * natural blackjack. Each hand is then played out in turn before moving on to the
  * next seat, and each hand is settled against the dealer independently.
  *
- * Written as plain JavaScript (single-quoted strings, no backticks or ${} so it
- * embeds here without a build).
+ * The page uses single-quoted strings (no inner backticks or ${}) only so this
+ * app source embeds cleanly as a string in THIS TypeScript file — an embedding
+ * constraint of the seed, not of apps. Runtime code is bundled by esbuild, so
+ * template literals work fine there (see src/assistant/code-assistant.ts).
  */
 const INDEX_JS = `
 // ── Blackjack 21 (multiplayer vs. a shared dealer). Pure realtime app.

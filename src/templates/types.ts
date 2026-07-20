@@ -9,6 +9,12 @@
  * ── RUNTIME CONTRACT (what generated/edited code must look like) ──
  *   - Provide a default export with a `fetch(request, env)` handler,
  *     e.g. `export default { fetch(request, env) { ... } }`.
+ *   - Code is bundled by esbuild before it runs, so modern JS is fine: build the
+ *     HTML page with a TEMPLATE LITERAL (backticks + `${}` interpolation) — that
+ *     is the preferred, most editable style. (The example seeds in `examples/`
+ *     avoid inner backticks only because their source is embedded as a string in
+ *     a `.ts` file; that is NOT a constraint on apps saved at runtime.) The only
+ *     hard limit is no npm/external imports.
  *   - Persist data ONLY through the capability broker handed in as `env.SYSTEM`.
  *     Two storage capabilities exist today:
  *

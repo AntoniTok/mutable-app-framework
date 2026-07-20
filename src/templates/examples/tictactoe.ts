@@ -24,8 +24,10 @@ import type { AppTemplate } from "../types";
  * where <room> is read from its own `location` (`?room=`, default "main") so the
  * same page works in any room. It sends `{type:"action", action}` frames, and
  * renders each `{type:"state"}`
- * broadcast. Written as plain JavaScript (single-quoted strings, no backticks
- * or template literals) so it needs no build step.
+ * broadcast. The app source is embedded in a template literal in THIS file, so
+ * its page uses single-quoted strings (no inner backticks) to embed cleanly —
+ * an embedding constraint of the seed, not of apps: runtime code is bundled by
+ * esbuild and may use backticks freely (see src/assistant/code-assistant.ts).
  */
 const INDEX_JS = `
 // Tic-tac-toe — base 3x3 example (multiplayer). Classic 3x3 board, 2 players.

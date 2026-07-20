@@ -20,8 +20,12 @@ import type { AppTemplate } from "../types";
  * <base href="/preview/">). It persists through the capability broker and makes
  * no network calls.
  *
- * Written as plain JavaScript (no backticks, to keep it easy to embed here) so
- * it needs no build step and doubles as a reference example for the AI author.
+ * The page is written as an array of single-quoted strings (no inner backticks)
+ * PURELY so this app source embeds cleanly as a plain string in THIS TypeScript
+ * file. That is a constraint of the seed's embedding, NOT of apps in general:
+ * code saved at runtime is bundled by esbuild, so template literals (backticks +
+ * ${}) work fine there — and are the preferred, more editable style (see the
+ * assistant prompt in src/assistant/code-assistant.ts).
  */
 const INDEX_JS = [
   "const PAGE = [",

@@ -25,8 +25,10 @@ import type { AppTemplate } from "../types";
  * Buttons/forms call the data endpoints with RELATIVE urls so they work inside
  * the preview. Persists only through the capability broker; no network calls.
  *
- * Plain JavaScript (no backticks) so it needs no build step and doubles as a
- * reference example for the AI author.
+ * The page uses single-quoted strings (no inner backticks) only so this app
+ * source embeds cleanly in THIS TypeScript file — not a runtime requirement.
+ * Runtime code is bundled by esbuild, so template literals work fine there and
+ * are the preferred style (see src/assistant/code-assistant.ts).
  */
 const INDEX_JS = [
   "const PAGE = [",

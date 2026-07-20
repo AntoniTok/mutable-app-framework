@@ -23,9 +23,11 @@ import type { AppTemplate } from "../types";
  *
  * Scope: simplified full-hand Hold'em — blinds, preflop/flop/turn/river betting
  * (fold/check/call/raise), a single main pot (NO side pots / no short all-in
- * side-pot math), and a 5-of-7 showdown evaluator. Written as plain JavaScript
- * (single-quoted strings, no backticks or ${} — so it embeds here and needs no
- * build step).
+ * side-pot math), and a 5-of-7 showdown evaluator. The app source is embedded in
+ * a template literal in THIS file, so its page uses single-quoted strings (no
+ * inner backticks or ${}) to embed cleanly — an embedding constraint of the seed,
+ * not of apps: runtime code is bundled by esbuild and may use backticks freely
+ * (see src/assistant/code-assistant.ts).
  */
 const INDEX_JS = `
 // ── Texas Hold'em (simplified). Pure realtime app: seats + applyAction + view.
