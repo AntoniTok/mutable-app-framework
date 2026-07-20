@@ -16,9 +16,11 @@ Object; each request runs the live version in an isolated Dynamic Worker; edits
   STREAMS the response. Exports the DOs + all capability entrypoints (store, fs,
   blob, fetch) + `DynamicWorkerTail`.
 - `src/agent/app-host.ts` — the Agent (DO). Source of truth for CODE + all
-  actions. Persists precompiled builds; holds the egress allowlist; exposes
-  `getRunManifest`/`getBuild`/`resolvePrebuilt` for the host-worker run path. It
-  does NOT hold app runtime data — that lives in the separate `AppData` DO.
+  actions. Persists precompiled builds; holds the egress allowlist; runs the app's
+  optional `onUpgrade` data migration on each forward promote (`#runDataUpgrade`,
+  tracked in the `__upgrade__` scope — limitation #10); exposes `getRunManifest`/
+  `getBuild`/`resolvePrebuilt` for the host-worker run path. It does NOT hold app
+  runtime data — that lives in the separate `AppData` DO.
 - `src/agent/app-data.ts` — the `AppData` Durable Object: an app's runtime data
   (key/value store + dofs filesystem) in its OWN isolated SQLite, one per room id.
   Reached DIRECTLY by the `ScopedStore`/`ScopedFilesystem` capability stubs (2
@@ -27,10 +29,12 @@ Object; each request runs the live version in an isolated Dynamic Worker; edits
 - `src/agent/runner.ts` — runs untrusted app code in a Dynamic Worker (injects
   the `SYSTEM` broker, `globalOutbound: null`, attaches the tail worker; uses a
   persisted build on a cold cache via `resolvePrebuilt`). Exposes fetch/reduce/
-  initialState/project/seats/probe/migrate over one injected adapter bundle.
+  initialState/project/seats/probe/migrate/onUpgrade over one injected adapter
+  bundle (`onUpgrade` = the app's own store/fs/blob data migration, #10 — it runs
+  with `env.SYSTEM`, unlike the pure `migrate`).
 - `src/agent/schema.ts` — AppHost's SQLite tables + query helpers (`files`,
-  `versions`, `builds`; `app_data` holds the realtime `__room__` + `__egress__`
-  scopes).
+  `versions`, `builds`; `app_data` holds the framework `__room__` + `__egress__` +
+  `__upgrade__` scopes).
 - `src/observability/dynamic-worker-tail.ts` — `DynamicWorkerTail`: captures each
   untrusted app run's logs/exceptions/outcome into Workers Logs, tagged by
   `workerId` (attached in `runner.ts`).
@@ -185,7 +189,9 @@ connect a WebSocket to `/agents/app-host/<room>?token=<id>` (the room read from
 the page's own `location`, default `main`). The realtime client MUST also handle
 the reserved `{type:"reload"}` frame (`location.reload()`) so it picks up new code
 after an edit, and should derive its `token` so identity is stable across
-reload/reopen (see Player identity below). See `src/templates/types.ts` and the
+reload/reopen (see Player identity below). Any app (realtime or not) may also
+export an optional `onUpgrade(env, ctx)` to migrate its OWN persisted data across
+a code change (#10 — see gotchas). See `src/templates/types.ts` and the
 assistant's system prompt in `src/assistant/code-assistant.ts` (keep the two in
 sync — that prompt is what the AI reads when writing app code).
 
@@ -394,13 +400,24 @@ After editing `wrangler.jsonc`, run `npm run types` to regenerate
   the last version that built and `status` flips to `error`. Auto-promotion
   still happens for any version that builds. (Manual `rollback` may still land
   on a broken version on purpose, for inspection.)
-- **State preservation across edits (#1).** A code edit no longer auto-wipes
-  realtime state. `coordinator.#ensureFreshState` runs KEEP → MIGRATE → RESET:
-  it probes the old state against the new bundle (via the sandboxed `probe` in
-  `runner.ts`, which exercises the app's `view`/`initialState`), keeps it if
-  compatible, else runs the app's optional pure `migrate(old, oldVersion)` and
-  keeps that if it re-probes ok, else reseeds `initialState` + clears seats. Keep
-  any existing `migrate`/`stateVersion` exports when editing an app.
+ - **State preservation across edits (#1).** A code edit no longer auto-wipes
+   realtime state. `coordinator.#ensureFreshState` runs KEEP → MIGRATE → RESET:
+   it probes the old state against the new bundle (via the sandboxed `probe` in
+   `runner.ts`, which exercises the app's `view`/`initialState`), keeps it if
+   compatible, else runs the app's optional pure `migrate(old, oldVersion)` and
+   keeps that if it re-probes ok, else reseeds `initialState` + clears seats. Keep
+   any existing `migrate`/`stateVersion` exports when editing an app.
+ - **App-data upgrades (#10).** `migrate` (#1) only reshapes the realtime
+   `__room__` state. The app's OWN data (store/fs/blob) is migrated by an optional
+   `onUpgrade(env, ctx)` export — NOT pure: it gets the same `env` as `fetch`
+   (`env.SYSTEM`), so it reads/rewrites that data. `AppHost.#runDataUpgrade` runs
+   it via `runner.runUpgrade` ONCE per FORWARD promote (right after the build
+   passes + the pointer advances), tracking the last-upgraded version in the
+   `__upgrade__` app_data scope; it is skipped on rollback and on the first seed
+   (fresh data). It must be IDEMPOTENT (guard on current shape) since it runs every
+   forward promote. If it throws, the code STAYS promoted but `status` flips to
+   `error` and the `__upgrade__` pointer is NOT advanced, so the next promote
+   retries from the same base. Keep any existing `onUpgrade` when editing an app.
 - **Precompiled builds (#4).** `setFiles`/seed persist the bundler output keyed
   by content hash (`schema.builds`). The runner (`loadWorker`) uses it on a COLD
   Worker Loader cache instead of re-running esbuild; `resolvePrebuilt` is only

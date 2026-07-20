@@ -128,6 +128,29 @@
  *   `migrate` must be PURE (like the reducer). Return the migrated state; return
  *   `undefined` to decline (the coordinator then resets).
  *
+ * ── APP-DATA UPGRADES (optional — `onUpgrade`, for NON-realtime data) ──
+ *   `migrate` above only reshapes the realtime shared state. Your app's OWN
+ *   persisted data — anything you wrote via `requestStore` / `requestFilesystem`
+ *   / `requestBlobStore` — is NOT versioned and NOT auto-migrated. If a code
+ *   change alters that data's shape, export an optional `onUpgrade(env, ctx)`:
+ *
+ *     export async function onUpgrade(env, ctx) {
+ *       // ctx = { fromVersion, toVersion }. `env` is the SAME as fetch's env,
+ *       // so you can READ and REWRITE your own data here (this is NOT pure):
+ *       const store = await env.SYSTEM.requestStore("main");
+ *       const cfg = await store.getJSON("cfg");
+ *       if (cfg && cfg.schema === 1) {
+ *         await store.putJSON("cfg", { schema: 2, ...cfg, theme: cfg.color });
+ *       }
+ *     }
+ *
+ *   The framework runs `onUpgrade` ONCE per FORWARD version bump, right after a
+ *   successful build+promote (never on rollback). Make it IDEMPOTENT and guard on
+ *   the CURRENT shape (e.g. `if (schema === 1)`), because it runs on every forward
+ *   promote, not only when the shape actually changed. If it throws, the new code
+ *   stays live but the app is flagged `status:"error"` and the upgrade is retried
+ *   on the next promote — so never leave data half-migrated; finish or throw.
+ *
  *   The client page (served by `fetch`) opens a WebSocket to the host at
  *   `/agents/app-host/<room>`, where <room> is read from the page's own
  *   `location` (`?room=`, default "main") — one page serves any room. It renders

@@ -141,6 +141,22 @@ function hostEntrySource(appEntry: string): string {
     "    const next = await fn(oldState, oldVersion);",
     "    return { ok: next !== undefined, state: next };",
     "  }",
+    "  // Optional app-DATA upgrade (limitation #10). Unlike `migrate` (which is a",
+    "  // PURE transform of the realtime __room__ state), `onUpgrade` may do I/O:",
+    "  // it gets the SAME env as fetch ({ SYSTEM }), so it can read AND rewrite the",
+    "  // app's OWN store/filesystem/blob data to match the new code. The host runs",
+    "  // it once per forward version change, right after a successful promote.",
+    "  // `ran:false` means the app exports no onUpgrade (a no-op, not an error).",
+    "  async onUpgrade(fromVersion, toVersion) {",
+    "    const fn = pick('onUpgrade');",
+    "    if (typeof fn !== 'function') return { ok: true, ran: false };",
+    "    try {",
+    "      await fn(this.env, { fromVersion, toVersion });",
+    "      return { ok: true, ran: true };",
+    "    } catch (e) {",
+    "      return { ok: false, ran: true, error: (e && e.message) ? e.message : String(e) };",
+    "    }",
+    "  }",
     "}",
     ""
   ].join("\n");
@@ -212,6 +228,15 @@ export interface ProbeResult {
   ok: boolean;
   /** True when the probed state is usable by the current code version. */
   compatible?: boolean;
+}
+
+/** RPC-serializable result of running the app's optional `onUpgrade` (see #10). */
+export interface UpgradeResult {
+  /** False only when the app's onUpgrade threw (`error` explains). */
+  ok: boolean;
+  /** True when the app actually exports an onUpgrade (false = nothing to run). */
+  ran?: boolean;
+  error?: string;
 }
 
 /**
@@ -499,4 +524,30 @@ export async function migrate(opts: {
     migrate(state: unknown, version: number): Promise<ReduceResult>;
   };
   return await logic.migrate(state, version);
+}
+
+/**
+ * Run the app's optional `onUpgrade(env, ctx)` export inside the sandbox to
+ * migrate the app's OWN persisted data (store / filesystem / blob) across a code
+ * change (limitation #10). Unlike the pure `migrate`, this runs with the app's
+ * capability broker (`env.SYSTEM`), so it can read and rewrite that data. The
+ * host calls this once per forward version change, right after a promote.
+ * Returns `{ ok:true, ran:false }` when the app exports no `onUpgrade`.
+ */
+export async function runUpgrade(opts: {
+  env: Env;
+  instance: string;
+  files: AppFile[];
+  entrypoint: string;
+  fromVersion: number;
+  toVersion: number;
+  resolvePrebuilt?: ResolvePrebuilt;
+}): Promise<UpgradeResult> {
+  const { env, instance, files, entrypoint, fromVersion, toVersion, resolvePrebuilt } = opts;
+  const { worker } = await getWorker({ env, instance, files, entrypoint, resolvePrebuilt });
+
+  const logic = worker.getEntrypoint("Logic") as unknown as {
+    onUpgrade(fromVersion: number, toVersion: number): Promise<UpgradeResult>;
+  };
+  return await logic.onUpgrade(fromVersion, toVersion);
 }

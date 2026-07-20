@@ -3,7 +3,7 @@ import type { Connection, ConnectionContext, WSMessage } from "agents";
 import type { Env } from "../types";
 import type { AppFile } from "../templates/types";
 import { getTemplate, DEFAULT_TEMPLATE_ID } from "../templates/registry";
-import { bundleApp, runApp, fingerprint } from "./runner";
+import { bundleApp, runApp, runUpgrade, fingerprint } from "./runner";
 import type { StoredBuild } from "./schema";
 import { RoomCoordinator } from "../realtime/coordinator";
 import type { ConnState, RoomHost } from "../realtime/coordinator";
@@ -59,6 +59,17 @@ const ROOM_SCOPE = "__room__";
  */
 const EGRESS_SCOPE = "__egress__";
 const EGRESS_KEY = "allow";
+
+/**
+ * Reserved app_data scope tracking which code version the app's OWN data (store/
+ * filesystem/blob) has been upgraded to (limitation #10). When a promote moves
+ * the live version forward, `setFiles` runs the app's optional `onUpgrade(env,
+ * ctx)` once, then advances this pointer. Held in AppHost (trusted) — the app
+ * can't touch it — because AppHost is the serialized owner of the version pointer
+ * and the single place a promote happens.
+ */
+const UPGRADE_SCOPE = "__upgrade__";
+const UPGRADE_KEY = "dataVersion";
 
 /**
  * Sentinel connection token for a READ-ONLY state subscriber (the editor chrome
@@ -120,6 +131,9 @@ export class AppHost extends Agent<Env, HostState> {
       if (template.egress && template.egress.length > 0) {
         db.appDataPut(this, EGRESS_SCOPE, EGRESS_KEY, JSON.stringify(template.egress));
       }
+      // Fresh data starts already "upgraded" to the seed version — there is no
+      // prior data to migrate, so onUpgrade must NOT run on the initial seed (#10).
+      db.appDataPut(this, UPGRADE_SCOPE, UPGRADE_KEY, String(version));
       this.setState({
         ...this.state,
         activeVersion: version,
@@ -325,6 +339,10 @@ export class AppHost extends Agent<Env, HostState> {
         status: "ready",
         lastError: null
       });
+      // Now that the new code is live, give it a chance to migrate the app's OWN
+      // persisted data (store/fs/blob) to the new shape (limitation #10). Runs
+      // once per forward promote, serialized here on AppHost's input gate.
+      await this.#runDataUpgrade(version);
       // The live code changed. Tell every connected client to reload so it picks
       // up the new page/app — otherwise only the tab that made the edit (which
       // reloads its own preview) would see it; everyone else would run stale code
@@ -422,6 +440,59 @@ export class AppHost extends Agent<Env, HostState> {
    * without losing `this`.
    */
   resolvePrebuilt = (hash: string): StoredBuild | undefined => db.getBuild(this, hash);
+
+  /**
+   * Run the app's optional `onUpgrade(env, ctx)` to migrate its OWN persisted
+   * data (store/fs/blob) after the live version moved FORWARD to `toVersion`
+   * (limitation #10). Forward-only and idempotent-per-version: we track the last
+   * version the data was upgraded to (`__upgrade__`), skip when the target isn't
+   * ahead of it, and only advance the pointer when the upgrade succeeds — so a
+   * failed upgrade retries on the next promote (from the same base version).
+   *
+   * The code is already promoted (the build passed); a failing onUpgrade does
+   * NOT un-promote it, but it flips `status` to "error" with a clear message so
+   * the developer sees the data migration needs attention.
+   */
+  async #runDataUpgrade(toVersion: number): Promise<void> {
+    const stored = db.appDataGet(this, UPGRADE_SCOPE, UPGRADE_KEY);
+    const fromVersion = stored === null ? 0 : Number(stored);
+    // Only migrate forward. Rollbacks (which don't go through here) and re-runs
+    // of an already-migrated version are no-ops.
+    if (!(toVersion > fromVersion)) return;
+
+    try {
+      const result = await runUpgrade({
+        env: this.env,
+        instance: this.name,
+        files: this.currentFilesSync(),
+        entrypoint: this.entrypoint(),
+        fromVersion,
+        toVersion,
+        resolvePrebuilt: this.resolvePrebuilt
+      });
+      if (result.ok) {
+        // Success (or the app exports no onUpgrade at all) — the data is now
+        // current for this version; advance the pointer so it won't re-run.
+        db.appDataPut(this, UPGRADE_SCOPE, UPGRADE_KEY, String(toVersion));
+      } else {
+        // The app's onUpgrade threw. Keep the code promoted, leave the pointer
+        // behind (so the next promote retries), and surface the failure.
+        this.setState({
+          ...this.state,
+          status: "error",
+          lastError: `Data upgrade failed (v${fromVersion}→v${toVersion}): ${result.error ?? "unknown error"}`
+        });
+      }
+    } catch (err) {
+      // The sandbox call itself failed (not the app throwing) — same handling.
+      const message = err instanceof Error ? err.message : String(err);
+      this.setState({
+        ...this.state,
+        status: "error",
+        lastError: `Data upgrade could not run (v${fromVersion}→v${toVersion}): ${message}`
+      });
+    }
+  }
 
   /** Try to build the live version; set status to ready or error accordingly. */
   private async validateActive(): Promise<void> {

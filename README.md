@@ -130,13 +130,15 @@ src/
                                via AppHost). dofs bundled + tree-shaken normally.
     schema.ts                  AppHost SQLite tables (files, versions, builds
                                [precompiled bundles]; app_data holds ONLY the
-                               framework __room__ + __egress__ scopes) + helpers.
+                               framework __room__ + __egress__ + __upgrade__
+                               scopes) + helpers.
     runner.ts                  Bundles live code + runs it in a Dynamic Worker
                                (SYSTEM only, no egress, content-hash cached,
                                DynamicWorkerTail attached; uses persisted builds on
                                a cold cache). runApp() serves fetch;
                                reduce()/initialState()/probe()/migrate() call the
-                               app's pure exports via an injected adapter (one bundle).
+                               app's pure exports, runUpgrade() the app's onUpgrade
+                               data migration (#10) — via an injected adapter (one bundle).
 
   observability/
     dynamic-worker-tail.ts     DynamicWorkerTail: captures each untrusted app
@@ -371,6 +373,8 @@ Defined in `src/templates/types.ts`. An app's files must:
 `AppTemplate.declares` lists the capabilities an app expects (e.g. `"store"`,
 `"fs"`, `"room"`). Multiplayer apps additionally export a pure `applyAction`
 reducer (+ optional `initialState`) — see [Multiplayer](#multiplayer-live-pure-reducer).
+Any app may also export an optional `onUpgrade(env, ctx)` to migrate its own
+persisted data across a code change (limitation #10 — see Multiplayer section).
 
 ---
 
@@ -577,6 +581,16 @@ keeps that if IT probes compatible, and only otherwise resets to `initialState`
 (clearing seats). So a cosmetic/logic edit no longer resets an in-progress game;
 a breaking state-shape change either migrates or resets. (See the state-
 preservation flow in `src/realtime/coordinator.ts` `#ensureFreshState`.)
+
+That `migrate` only reshapes the realtime `__room__` state. An app's OWN persisted
+data — whatever it wrote via `requestStore`/`requestFilesystem`/`requestBlobStore`
+— is migrated by a separate optional export, `onUpgrade(env, ctx)` (limitation
+#10). Unlike `migrate` it is NOT pure: it receives the same `env` as `fetch`, so
+it can read and rewrite that data. `AppHost` runs it once per FORWARD promote
+(right after a successful build), tracking the last-upgraded version in the
+`__upgrade__` scope; it's skipped on rollback/first seed and must be idempotent.
+If it throws, the new code stays live but the app is flagged `status:"error"` and
+the upgrade retries on the next promote. (See `AppHost.#runDataUpgrade`.)
 
 ---
 
