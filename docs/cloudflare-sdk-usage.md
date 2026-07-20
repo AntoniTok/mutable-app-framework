@@ -2,9 +2,11 @@
 
 This document explains our central design idea — **the program lives as
 data** — and then walks each Cloudflare technology, listing what we use,
-what we don't, and why. It reflects the codebase *after* introducing Durable
-Object Facets and Dynamic Worker Tail observability, and the later additions of
-**Code Mode** (a second Dynamic Worker sandbox for the assistant's orchestration
+what we don't, and why. It reflects the codebase *after* moving all app runtime
+data into a dedicated top-level **`AppData` Durable Object** (which replaced an
+earlier Durable Object *Facet* — see §"App runtime data" for that history) and
+adding Dynamic Worker Tail observability, plus the later additions of **Code
+Mode** (a second Dynamic Worker sandbox for the assistant's orchestration
 scripts), Think's **built-in context management** (compaction / overflow /
 recovery), and **alarm-based scheduling** in `AppHost` (debounced live-reload +
 version-history GC).
@@ -76,7 +78,7 @@ capability broker, the realtime coordinator — is a **consumer** of that truth,
 never a second owner of it. That single-owner, gated-write discipline explains
 nearly every SDK decision below.
 
-### Two kinds of truth (why the facet exists)
+### Two kinds of truth (why app data lives in its own DO)
 
 Code and app *runtime data* have opposite lifecycles:
 
@@ -85,10 +87,12 @@ Code and app *runtime data* have opposite lifecycles:
 | Nature | Versioned artifact | Live mutable state |
 | Written by | The build-gate (`setFiles`) | The running app, per request |
 | Rolled back? | Yes | No — it's "now" |
-| Owner | `AppHost` supervisor SQLite | **A facet's isolated SQLite** |
+| Owner | `AppHost` supervisor SQLite | **A dedicated `AppData` DO's isolated SQLite** |
 
-Because they differ, they now live in different stores: **code stays in
-`AppHost`; app runtime data moved into a Durable Object Facet** (see §Facets).
+Because they differ, they live in different stores: **code stays in `AppHost`;
+app runtime data lives in a separate top-level `AppData` Durable Object** (see
+§"App runtime data" — that section also records why this was first a *facet* and
+why we later promoted it to a top-level DO).
 
 ---
 
@@ -126,8 +130,8 @@ mid-window — the alarm is the idiomatic fix.
 
 **Used:** `env.LOADER.get()`, `createWorker()`, custom `SYSTEM` capability-binding
 injection, `globalOutbound: null` (no network egress), content-hash warm caching,
-**Durable Object Facets** (all app runtime data — see below), **Tail Workers**
-(per-run observability — see below), and a **second sandbox for Code Mode**:
+**Tail Workers** (per-run observability — see below), and a **second sandbox for
+Code Mode**:
 `@cloudflare/codemode`'s `DynamicWorkerExecutor({ loader: this.env.LOADER })` runs
 the assistant's orchestration scripts in their own Dynamic Worker (see the Codemode
 section).
@@ -187,47 +191,78 @@ triggers. R2 is a **reserved** broker hook (`requestBlobStore`), not bound.
 untrusted app gets scoped powers without touching a real binding (invariant #2).
 No persistence services are bound because everything lives in DO SQLite by design.
 
-### Durable Object Facets — used (ALL app runtime data)
+### App runtime data — a dedicated top-level `AppData` DO (used)
 
-**Used:** `this.ctx.facets.get(...)` in `AppHost` runs a trusted `AppStorageFacet`
-(loaded via the Worker Loader, `worker.getDurableObjectClass(...)`) with its
-**own isolated SQLite**. **Both** kinds of app runtime data live there: the
-key/value store (`env.SYSTEM.requestStore`) *and* the filesystem
-(`env.SYSTEM.requestFilesystem`, backed by dofs). See
-`src/agent/facet/entry.ts` (the facet class), `src/agent/app-storage-facet.ts`
-(the surface), and `AppHost.#appData()` (the forwarding layer).
+**Used:** a top-level Durable Object `AppData` (`src/agent/app-data.ts`), one per
+room id, with its **own isolated SQLite**. **Both** kinds of app runtime data
+live there: the key/value store (`env.SYSTEM.requestStore`) *and* the filesystem
+(`env.SYSTEM.requestFilesystem`, backed by dofs). The `ScopedStore` /
+`ScopedFilesystem` capability stubs reach it **directly** —
+`env.APP_DATA.get(idFromName(instance))` — so the data path is exactly two hops
+(app → scoped stub → `AppData`) and never passes through `AppHost`.
 
-**Not used:** letting *untrusted* app code define the facet class directly (the
-docs' "give dynamic code storage" pattern). Here the facet class is **trusted
-framework code**; the untrusted app still reaches it only through the broker.
+**Not used:** letting *untrusted* app code define the DO class directly. The class
+is **trusted framework code**; the untrusted app still reaches it only through the
+broker, which validates/quota-checks/path-sanitises every call.
 
-**Why:** Code and runtime data have opposite lifecycles. A facet gives runtime
-data its own isolated SQLite (blast-radius isolation — a chatty app can't bloat
-version history), its own input gate (app writes no longer serialize behind code
-ops and the realtime coordinator), and platform-enforced isolation. Crucially,
-**host-side mediation is preserved**: the broker still validates, quota-checks,
-and path-sanitises every call before `AppHost` forwards it into the facet — facets
-add *isolation*, the broker keeps *policy*. Only the realtime coordinator's own
-state remains in `AppHost`'s SQLite (the `__room__` scope), since it's framework
-state, not app data.
+**Why:** Code and runtime data have opposite lifecycles. A separate DO gives
+runtime data its own isolated SQLite (blast-radius isolation — a chatty app can't
+bloat version history), its own input gate (app writes don't serialize behind code
+ops or the realtime coordinator), and platform-enforced isolation. **Host-side
+mediation is preserved**: the broker's scoped stubs keep *policy*; the DO adds
+*isolation*. Only the realtime coordinator's own state (the `__room__` scope) and
+the trusted egress allowlist (the `__egress__` scope) remain in `AppHost`'s SQLite,
+since they're framework state, not app data.
 
-### `@cloudflare/dofs` (Workspace) — partial: vendored, fs-layer only, runs in the facet
+#### History: first a Facet, then a top-level DO (limitation #3)
+
+This data first lived in a **Durable Object *Facet*** — `AppStorageFacet`, a child
+DO reached via `AppHost`'s `this.ctx.facets.get(...)`. We reached for facets
+because they are *the* idiomatic way to give a DO a second, isolated SQLite: a
+facet runs beneath a parent DO with its own storage and input gate, and the
+platform enforces that neither can read the other's database. That got us the
+isolation we wanted (app data off `AppHost`'s code store) with a trusted class we
+still fronted with the broker.
+
+The catch is **structural**: a facet is only reachable *through its parent*. There
+is no way to address a facet by name from outside — you must call the parent DO,
+which then calls `ctx.facets.get`. So every `store.get` / `fs.read` was **three
+hops**: `app → ScopedStore → AppHost → AppStorageFacet`. That reintroduced exactly
+the coupling the facet was meant to remove — `AppHost` (the single per-room code +
+realtime DO) sat on the hot path of *every* storage call, so storage traffic
+contended with code reads and the realtime coordinator on `AppHost`'s single
+input gate. This is limitation **#3** ("single-DO funneling + 3-hop storage").
+
+Promoting the same logic to a **top-level `AppData` DO** keeps every benefit the
+facet gave us (isolated SQLite, own input gate, platform isolation, broker-kept
+policy) while removing the forced middle hop: a top-level DO *can* be addressed by
+name, so `ScopedStore`/`ScopedFilesystem` call it directly (**two hops**) and
+`AppHost` leaves the storage path entirely. The class body is essentially
+unchanged — it moved from `src/agent/facet/entry.ts` (bundled to a string for the
+Worker Loader) to `src/agent/app-data.ts` (a normally-bundled DO), so we also
+dropped the `build:facet` esbuild step and the loader indirection. The lesson:
+**facets are the right tool when the second store is genuinely subordinate to one
+parent and only that parent needs it; when many callers need it directly, a
+top-level DO avoids the parent becoming a funnel.**
+
+### `@cloudflare/dofs` (Workspace) — partial: vendored, fs-layer only
 
 **Used:** `Database` + `initializeSchema` + `WorkspaceFilesystem` from a
 **vendored** `@cloudflare/dofs` — the SQLite virtual filesystem powering the
-`notes` app's filesystem capability. It now runs **inside the facet**
-(`src/agent/facet/entry.ts`), bundled and tree-shaken to only the filesystem
-layer by `scripts/build-facet.mjs`. It no longer executes in the host isolate.
+`notes` app's filesystem capability. It runs **inside the `AppData` DO**
+(`src/agent/app-data.ts`), tree-shaken to only the filesystem layer by the normal
+worker bundle (it needs `nodejs_compat`, which the worker already enables). It does
+not execute in the host worker's fetch isolate.
 
 **Unused:** the full `@cloudflare/workspace` package, Container/`wsd` FUSE backend,
 capnweb sync protocol, git/blob-cache machinery — all **stripped** from the
-vendored build (and further dropped by tree-shaking the facet bundle).
+vendored build.
 
 **Why:** We needed *only* a DO-SQLite filesystem primitive. It was valuable
-enough to vendor and pin (`file:./vendor/dofs`). dofs is orthogonal to facets: it
-is a *data-shape* primitive (turns SQLite into a filesystem), while facets are a
-*storage-location* primitive — so it composes cleanly, running on the facet's own
-isolated storage.
+enough to vendor and pin (`file:./vendor/dofs`). dofs is orthogonal to where the
+storage lives: it is a *data-shape* primitive (turns SQLite into a filesystem),
+so it composed cleanly on the facet's isolated storage and composes just as
+cleanly now on the `AppData` DO's storage.
 
 ### Sandbox SDK (`@cloudflare/sandbox`) — not used
 
@@ -274,14 +309,14 @@ is precisely why we bypass Think's helper and control the tool list ourselves.
    run to bound runaway generated code, complementing `globalOutbound: null`.
 2. **Consider AI Gateway** in front of the model calls for caching,
    rate-limiting, and cost/latency observability on the agentic loop.
-3. **Bundle weight is now dominated by Think.** Moving dofs into the facet trims
-   the host worker only modestly (~30 KB): the facet source still ships *embedded
-   as a string* in the host bundle (it must, to hand to the Worker Loader), but
-   dofs no longer executes in the host isolate. The remaining ~5 MB is Think's
-   transitive deps (`ai` v6, `@cloudflare/shell`, just-bash) plus codemode — but
-   codemode is no longer *dead* weight, since the `code_mode` tool now uses it
-   directly. None of these can be dropped without removing the assistant or Code
-   Mode.
+3. **Bundle weight is dominated by Think.** dofs now bundles into the worker
+   normally (it executes only in the `AppData` DO's isolate, not the fetch
+   isolate), which is roughly weight-neutral versus the old facet-as-a-string
+   approach. The bulk of the bundle is Think's transitive deps (`ai` v6,
+   `@cloudflare/shell`, just-bash) plus codemode — the whole host worker measures
+   ~1.46 MB gzip, well under the 3 MB Free / 10 MB paid limits. codemode is no
+   longer *dead* weight, since the `code_mode` tool uses it directly. None of
+   these can be dropped without removing the assistant or Code Mode.
 
 **For the SDK teams (feedback):**
 1. **Publish `dofs`'s filesystem layer as a supported standalone.** Clearest
@@ -296,7 +331,11 @@ is precisely why we bypass Think's helper and control the tool list ourselves.
 3. **Support a "bring-your-own-filesystem" hook in Think.** Its biggest friction:
    it assumes the agent owns its filesystem. Users whose source of truth is
    external/gated (another DO, VCS, a build step) must disable the built-in tools.
-4. **Facets' value scales with app-data weight + isolation needs.** For
-   prototype-scale apps the broker-over-shared-SQLite approach is often enough;
-   facets pay off as data grows, write throughput contends with realtime, or the
-   threat model demands platform-enforced isolation over trusted-code correctness.
+4. **Make facets addressable by name (or document the funnel).** Facets are the
+   natural way to give a DO a second isolated SQLite, but because a facet is only
+   reachable *through its parent*, using one for data that many callers need turns
+   the parent into a hot-path funnel (our limitation #3 — we moved off a facet to
+   a top-level `AppData` DO for exactly this). A way to address a facet directly,
+   or clearer guidance that facets suit *parent-private* sub-stores only, would
+   have saved us the migration. As a rule: isolated sub-store used by one parent →
+   facet; isolated store many callers hit directly → top-level DO.

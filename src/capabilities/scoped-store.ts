@@ -1,6 +1,6 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { getAgentByName } from "agents";
-import type { AppDataStore, Env } from "../types";
+import type { AppData } from "../agent/app-data";
+import type { Env } from "../types";
 
 /**
  * A private key/value store handed to an app by the broker.
@@ -10,7 +10,9 @@ import type { AppDataStore, Env } from "../types";
  * `props.namespace` (which drawer within that app), so one app can never see
  * another's data.
  *
- * Backed by the AppHost's own SQLite `app_data` table — no external resource.
+ * Backed by the per-room `AppData` Durable Object's OWN SQLite. This stub talks
+ * to that DO DIRECTLY (by name) — the request never passes through AppHost, so
+ * storage traffic never funnels through the code DO (limitation #3).
  */
 export type ScopedStoreProps = {
   instance: string;
@@ -18,37 +20,31 @@ export type ScopedStoreProps = {
 };
 
 export class ScopedStore extends WorkerEntrypoint<Env, ScopedStoreProps> {
-  #host(): Promise<AppDataStore> {
-    // Reach the exact AppHost instance this capability was scoped to.
-    return getAgentByName(
-      this.env.AppHost,
-      this.ctx.props.instance
-    ) as unknown as Promise<AppDataStore>;
+  /** The exact AppData DO this capability was scoped to (2-hop direct reach). */
+  #store(): DurableObjectStub<AppData> {
+    const id = this.env.APP_DATA.idFromName(this.ctx.props.instance);
+    return this.env.APP_DATA.get(id);
   }
 
   async get(key: string): Promise<string | null> {
-    const host = await this.#host();
-    return host.storeGet(this.ctx.props.namespace, key);
+    return this.#store().storeGet(this.ctx.props.namespace, key);
   }
 
   async put(key: string, value: string): Promise<void> {
-    const host = await this.#host();
     // Basic guardrails live here in the trusted host, not in the app.
     if (typeof value !== "string") value = String(value);
     if (value.length > 1_000_000) {
       throw new Error("Value too large (max 1MB).");
     }
-    await host.storePut(this.ctx.props.namespace, key, value);
+    await this.#store().storePut(this.ctx.props.namespace, key, value);
   }
 
   async delete(key: string): Promise<void> {
-    const host = await this.#host();
-    await host.storeDelete(this.ctx.props.namespace, key);
+    await this.#store().storeDelete(this.ctx.props.namespace, key);
   }
 
   async list(): Promise<string[]> {
-    const host = await this.#host();
-    return host.storeList(this.ctx.props.namespace);
+    return this.#store().storeList(this.ctx.props.namespace);
   }
 
   /**
@@ -61,8 +57,7 @@ export class ScopedStore extends WorkerEntrypoint<Env, ScopedStoreProps> {
     if (typeof delta !== "number" || !Number.isFinite(delta)) {
       throw new Error("incr delta must be a finite number.");
     }
-    const host = await this.#host();
-    return host.storeIncr(this.ctx.props.namespace, key, delta);
+    return this.#store().storeIncr(this.ctx.props.namespace, key, delta);
   }
 
   /**
@@ -72,8 +67,7 @@ export class ScopedStore extends WorkerEntrypoint<Env, ScopedStoreProps> {
    */
   async cas(key: string, expected: string | null, next: string): Promise<boolean> {
     if (typeof next !== "string") next = String(next);
-    const host = await this.#host();
-    return host.storeCas(this.ctx.props.namespace, key, expected, next);
+    return this.#store().storeCas(this.ctx.props.namespace, key, expected, next);
   }
 
   /**

@@ -1,14 +1,8 @@
 import { Agent } from "agents";
 import type { Connection, ConnectionContext, WSMessage } from "agents";
-import type { Env, FsDirent, FsFound, FsGrepMatch, FsStat } from "../types";
+import type { Env } from "../types";
 import type { AppFile } from "../templates/types";
 import { getTemplate, DEFAULT_TEMPLATE_ID } from "../templates/registry";
-import {
-  APP_STORAGE_FACET_NAME,
-  APP_STORAGE_FACET_SOURCE,
-  APP_STORAGE_FACET_WORKER_ID,
-  type AppStorageFacetStub
-} from "./app-storage-facet";
 import { bundleApp, runApp, fingerprint } from "./runner";
 import type { StoredBuild } from "./schema";
 import { RoomCoordinator } from "../realtime/coordinator";
@@ -24,6 +18,13 @@ import * as db from "./schema";
  *
  * It knows nothing about WHICH app or WHICH AI model — it only manipulates code
  * as data through stable contracts (AppTemplate, CodeAuthor).
+ *
+ * It does NOT hold the app's runtime data. The app's key/value store and
+ * filesystem live in a separate top-level `AppData` Durable Object (its own
+ * isolated SQLite), reached directly by the capability stubs — so storage
+ * traffic never funnels through this DO (limitation #3). AppHost keeps only the
+ * realtime coordinator's own state (the `__room__` scope) and the trusted egress
+ * allowlist (the `__egress__` scope) in its `app_data` table.
  */
 
 export type HostStatus = "ready" | "building" | "error";
@@ -449,93 +450,6 @@ export class AppHost extends Agent<Env, HostState> {
       : [];
     db.appDataPut(this, EGRESS_SCOPE, EGRESS_KEY, JSON.stringify(clean));
     return clean;
-  }
-
-  // ── app runtime data (invoked by the ScopedStore / ScopedFilesystem
-  //    capabilities over RPC) ──
-  //
-  // ALL of an app's runtime data — its key/value store AND its filesystem — lives
-  // in a FACET: a child Durable Object with its own isolated SQLite, separate
-  // from this supervisor's code/version store. These methods are the trusted
-  // forwarding layer: the broker's scoped stubs have already validated,
-  // quota-checked, and path-sanitised the call (see src/capabilities/), and
-  // AppHost forwards it into the facet. AppHost never exposes the facet directly,
-  // so host-side mediation is preserved while storage is isolated. (Only the
-  // realtime coordinator's own state stays in AppHost's SQLite, under __room__.)
-
-  /**
-   * Get (or resume) the app-data facet and return its RPC stub. `facets.get`
-   * only runs the callback on a cold/hibernated facet; otherwise it reuses the
-   * running one. The facet class is trusted framework code (it bundles the
-   * tree-shaken dofs filesystem layer) loaded through the Worker Loader — facets
-   * must come from `getDurableObjectClass`. `nodejs_compat` is required because
-   * dofs uses node:crypto/node:events.
-   */
-  #appData(): AppStorageFacetStub {
-    const env = this.env;
-    const facet = this.ctx.facets.get(APP_STORAGE_FACET_NAME, () => {
-      const worker = env.LOADER.get(APP_STORAGE_FACET_WORKER_ID, () => ({
-        compatibilityDate: "2026-01-01",
-        compatibilityFlags: ["nodejs_compat"],
-        mainModule: "facet.js",
-        modules: { "facet.js": APP_STORAGE_FACET_SOURCE },
-        // Trusted, but it needs no network — keep the hard sandbox default.
-        globalOutbound: null
-      }));
-      return { class: worker.getDurableObjectClass("AppStorageFacet") };
-    });
-    return facet as unknown as AppStorageFacetStub;
-  }
-
-  // key/value store
-  async storeGet(scope: string, key: string): Promise<string | null> {
-    return this.#appData().storeGet(scope, key);
-  }
-  async storePut(scope: string, key: string, value: string): Promise<void> {
-    await this.#appData().storePut(scope, key, value);
-  }
-  async storeDelete(scope: string, key: string): Promise<void> {
-    await this.#appData().storeDelete(scope, key);
-  }
-  async storeList(scope: string): Promise<string[]> {
-    return this.#appData().storeList(scope);
-  }
-  async storeIncr(scope: string, key: string, delta: number): Promise<number> {
-    return this.#appData().storeIncr(scope, key, delta);
-  }
-  async storeCas(
-    scope: string,
-    key: string,
-    expected: string | null,
-    next: string
-  ): Promise<boolean> {
-    return this.#appData().storeCas(scope, key, expected, next);
-  }
-
-  // filesystem (dofs runs inside the facet; these just forward)
-  async fsReadFile(namespace: string, path: string): Promise<string | null> {
-    return this.#appData().fsReadFile(namespace, path);
-  }
-  async fsWriteFile(namespace: string, path: string, content: string): Promise<void> {
-    await this.#appData().fsWriteFile(namespace, path, content);
-  }
-  async fsReaddir(namespace: string, path: string): Promise<FsDirent[] | null> {
-    return this.#appData().fsReaddir(namespace, path);
-  }
-  async fsMkdir(namespace: string, path: string): Promise<void> {
-    await this.#appData().fsMkdir(namespace, path);
-  }
-  async fsRm(namespace: string, path: string, recursive: boolean): Promise<void> {
-    await this.#appData().fsRm(namespace, path, recursive);
-  }
-  async fsStat(namespace: string, path: string): Promise<FsStat | null> {
-    return this.#appData().fsStat(namespace, path);
-  }
-  async fsGrep(namespace: string, pattern: string, path: string): Promise<FsGrepMatch[]> {
-    return this.#appData().fsGrep(namespace, pattern, path);
-  }
-  async fsFind(namespace: string, dir: string, pattern?: string): Promise<FsFound[]> {
-    return this.#appData().fsFind(namespace, dir, pattern);
   }
 
   // ── internals ──

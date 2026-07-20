@@ -1,7 +1,7 @@
 # Mutable App Framework
 
 A **self-modifying application framework** built on Cloudflare's Agents SDK,
-Durable Objects, Dynamic Workers, and Durable Object Facets.
+Durable Objects, and Dynamic Workers.
 
 An "app" is not deployed as code — it lives as **data** inside a Durable Object.
 Requests run the app's *current* source in an isolated Dynamic Worker. You change
@@ -19,8 +19,8 @@ the app — by hand or by asking an AI — and the next request runs the new cod
                     ┌──────────────── STABLE CORE (the framework) ───────────────┐
 Browser ─── HTTP ──▶│  server.ts → AppHost (Durable Object, one per room)        │
  lobby + room UI    │    • stores app CODE + version history in its own SQLite   │
-                    │    • runs the live version in a sandbox (runner.ts)        │
-                    │    • app runtime data lives in a FACET (isolated SQLite)   │
+                     │    • runs the live version in a sandbox (runner.ts)        │
+                     │    • app runtime data lives in a separate AppData DO       │
                     │    • edits the app via an AI assistant (host-side)         │
                     │  contracts:  AppHost RPC        AppTemplate + fetch()      │
                     └──────▲───────────────────────────────────▲─────────────────┘
@@ -103,13 +103,9 @@ change promotes a new live version, **every connected client auto-reloads** too
 | --- | --- |
 | `npm run dev` | Local dev server (`wrangler dev`) |
 | `npm run deploy` | Deploy to Cloudflare (`wrangler deploy`) |
-| `npm run build:facet` | Bundle the storage facet (+ tree-shaken dofs) into `bundle.generated.ts` |
 | `npm run types` | Regenerate `worker-configuration.d.ts` from `wrangler.jsonc` |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run smoke` | Runtime checks for the live app (dev server must be running) |
-
-`build:facet` runs automatically before `dev`, `start`, `deploy`, and `typecheck`
-(npm `pre*` hooks), so the generated facet source is always current.
 
 ---
 
@@ -125,24 +121,22 @@ src/
   agent/
     app-host.ts                THE AGENT (Durable Object): stores/versions CODE,
                                runs it, setFiles / rollback / reset / preview.
-                               store*/fs* RPC methods forward to the facet.
+                               Holds only CODE (+ __room__/__egress__ scopes) —
+                               NOT app runtime data (that's the AppData DO).
+    app-data.ts                AppData Durable Object: the app's runtime data
+                               (key/value store + dofs filesystem) in its OWN
+                               isolated SQLite, one per room. Reached DIRECTLY by
+                               the ScopedStore/ScopedFilesystem stubs (2 hops, not
+                               via AppHost). dofs bundled + tree-shaken normally.
     schema.ts                  AppHost SQLite tables (files, versions, builds
-                               [precompiled bundles]; app_data holds the realtime
-                               __room__ + __egress__ scopes) + helpers.
+                               [precompiled bundles]; app_data holds ONLY the
+                               framework __room__ + __egress__ scopes) + helpers.
     runner.ts                  Bundles live code + runs it in a Dynamic Worker
                                (SYSTEM only, no egress, content-hash cached,
                                DynamicWorkerTail attached; uses persisted builds on
                                a cold cache). runApp() serves fetch;
                                reduce()/initialState()/probe()/migrate() call the
                                app's pure exports via an injected adapter (one bundle).
-    facet/
-      entry.ts                 AppStorageFacet: the app's runtime data (key/value
-                               store + dofs filesystem) in its OWN isolated SQLite,
-                               run as a facet beneath AppHost.
-      bundle.generated.ts      AUTO-GENERATED bundled facet source (npm run
-                               build:facet); handed to the Worker Loader.
-    app-storage-facet.ts       Facet surface: re-exports the bundled source, the
-                               loader id / facet name, and the RPC stub type.
 
   observability/
     dynamic-worker-tail.ts     DynamicWorkerTail: captures each untrusted app
@@ -154,10 +148,10 @@ src/
                                requestFilesystem() + requestBlobStore() +
                                requestFetch() active; requestRoom reserved.
     scoped-store.ts            Per-app key/value store (mediated here; backed by
-                               the facet via AppHost). Includes ATOMIC incr()/cas()
-                               and JSON putJSON()/getJSON() helpers.
+                               the AppData DO, reached directly). Includes ATOMIC
+                               incr()/cas() and JSON putJSON()/getJSON() helpers.
     scoped-filesystem.ts       Per-app filesystem (namespace-scoped, path-sanitised;
-                               dofs runs in the facet, reached via AppHost).
+                               dofs runs in the AppData DO, reached directly).
     scoped-blob-store.ts       Per-app R2-backed BLOB store for large binaries
                                (key-prefixed per instance/namespace).
     scoped-fetcher.ts          Mediated outbound fetch (send()): app stays egress-
@@ -203,23 +197,22 @@ public/
   room.html                    A room: live app + on-demand editor ("Edit"),
                                at /room.html?room=<id>.
 
-wrangler.jsonc                 Bindings: AppHost + CodeAssistant DOs, LOADER, AI,
-                               BLOBS (R2), static assets, ASSISTANT_MODEL var,
-                               observability (head_sampling_rate: 1 for the tail).
+wrangler.jsonc                 Bindings: AppHost + CodeAssistant + AppData DOs,
+                               LOADER, AI, BLOBS (R2), static assets,
+                               ASSISTANT_MODEL var, observability
+                               (head_sampling_rate: 1 for the tail).
 worker-configuration.d.ts      Generated binding/runtime types. NOTE: `npm run
                                types` regenerates a stricter d.ts that breaks tsc;
                                the committed copy is hand-kept (add bindings by hand).
 
 scripts/
-  build-facet.mjs              esbuild step: bundles the facet (+ tree-shaken
-                               dofs) into src/agent/facet/bundle.generated.ts.
   smoke.mjs                    Dependency-free runtime smoke test for the live app.
 
 vendor/
   dofs/                        Vendored @cloudflare/dofs (unpublished): its built
                                dist is committed and referenced via a file:
-                               dependency. Bundled into the facet (tree-shaken) to
-                               power the filesystem capability.
+                               dependency. Bundled (tree-shaken) into the AppData
+                               DO to power the filesystem capability.
 ```
 
 ---
@@ -234,7 +227,7 @@ Browser → server.ts (/preview/*) → AppHost.getRunManifest()  (fetch CODE onl
           precompiled build (persisted on promote) is used; else it bundles.
             env = { SYSTEM: broker },  globalOutbound = null,  tails = [tail]
         → app.fetch() runs; may call env.SYSTEM.requestStore() → ScopedStore
-            → AppHost forwards into the app-data FACET (its own isolated SQLite)
+            → the AppData DO directly (its own isolated SQLite; 2 hops, not AppHost)
         → response STREAMED back; HTML gets <base href="/preview/"> injected via
           HTMLRewriter (also streaming) so relative links/buttons work.
         → after the run, DynamicWorkerTail ships the app's logs to Workers Logs.
@@ -284,23 +277,27 @@ live mutable state — so they live in **separate** SQLite databases.
 - `app_data(scope, k, v)` — the realtime engine's `__room__` state (the
   coordinator's own state) AND the reserved `__egress__` allowlist. Not app data.
 
-**The facet's isolated SQLite** (`AppStorageFacet`, a child DO) holds the app's
-RUNTIME DATA, reached via the broker and forwarded by AppHost:
+**The `AppData` DO's isolated SQLite** (a separate top-level DO, one per room)
+holds the app's RUNTIME DATA, reached via the broker's scoped stubs DIRECTLY (2
+hops, never through AppHost — limitation #3):
 
 - `app_data(scope, k, v)` — the app's key/value store (broker `requestStore`),
   including the atomic `incr`/`cas` primitives.
 - `vfs_*` — the app's private **filesystem** (broker `requestFilesystem`), managed
-  by `@cloudflare/dofs` (bundled into the facet). A real POSIX-ish filesystem
-  (folders, `stat`, `grep`, `find`) for small structured data (files capped at
-  256 KiB), not large blobs.
+  by `@cloudflare/dofs` (bundled into the `AppData` DO). A real POSIX-ish
+  filesystem (folders, `stat`, `grep`, `find`) for small structured data (files
+  capped at 256 KiB), not large blobs.
 
 Large binaries live in **R2** (broker `requestBlobStore`), keyed by an
 `<instance>/<namespace>/` prefix — not in either SQLite.
 
-The facet has its own database (AppHost can't read it) and its own input gate, so
-a chatty app can't bloat version history or contend with the realtime coordinator.
-The untrusted app still never touches the facet directly — the broker's scoped
-stubs validate/quota/sanitise, and AppHost forwards the call in.
+The `AppData` DO has its own database (AppHost can't read it) and its own input
+gate, so a chatty app can't bloat version history or contend with the realtime
+coordinator — and because the scoped stubs address it directly, storage traffic
+never funnels through AppHost. The untrusted app still never touches it directly:
+the broker's scoped stubs validate/quota/sanitise every call. (This data was
+formerly held in a Durable Object *facet* beneath AppHost; it was promoted to a
+top-level DO to drop the forced third hop — see `docs/cloudflare-sdk-usage.md`.)
 
 Small, synced state (`this.setState`) holds only a pointer:
 `{ activeVersion, status, templateId, lastError }`. Code is kept in SQL (never
@@ -434,9 +431,9 @@ The app contract and runner don't change — apps just call
 The **filesystem capability** (`requestFilesystem` → `ScopedFilesystem`) is a
 real, shipped instance of exactly this pattern: it mirrors the
 `requestStore` → `ScopedStore` chain, adds path sanitisation + a namespace
-prefix in the trusted `ScopedFilesystem`, and delegates (via AppHost) to
-`@cloudflare/dofs` running inside the app-data **facet**'s isolated SQLite — so it
-needed no new binding at all.
+prefix in the trusted `ScopedFilesystem`, and delegates (directly, not via
+AppHost) to `@cloudflare/dofs` running inside the **`AppData` DO**'s isolated
+SQLite — so it needed no new binding beyond the `APP_DATA` DO itself.
 
 ### Multiplayer (live: pure-reducer)
 
@@ -650,13 +647,15 @@ version history and realtime state). The default room is `main`.
   (Session/DO SQLite) — they never touch app files or the app sandbox, so they
   don't affect isolation. Compaction relies on the app being re-readable, which
   the system prompt already instructs.
-- **App runtime data lives in a facet.** The key/value store and the dofs
-  filesystem run in `AppStorageFacet` (its own isolated SQLite), not AppHost; the
-  broker still mediates every call. dofs is bundled into the facet (tree-shaken),
-  so it no longer executes in the host isolate — though the ~28 KiB facet source
-  still ships embedded as a string (to hand to the Worker Loader), making the
-  host-bundle trim modest. Rooms created before this change won't see their old
-  pre-facet `app_data` KV — use a fresh room id (or clear `.wrangler/`).
+- **App runtime data lives in the `AppData` DO (limitation #3).** The key/value
+  store and the dofs filesystem run in `AppData` (its own isolated SQLite, one per
+  room), reached DIRECTLY by the ScopedStore/ScopedFilesystem stubs — two hops,
+  never through AppHost — so storage traffic doesn't funnel through the code DO.
+  The broker still mediates every call. dofs is bundled (tree-shaken) into the
+  worker and executes only in the `AppData` DO's isolate. This replaced an earlier
+  `AppStorageFacet` facet (reached via `AppHost.ctx.facets.get`, 3 hops); `AppData`
+  is a new SQLite DO (migration `tag: "v3"`). Rooms created before this change
+  won't carry their data across — use a fresh room id (or clear `.wrangler/`).
 - **Dynamic Worker logs need the tail worker.** A Dynamic Worker runs in its own
   context, so its `console.log()`/exceptions aren't captured automatically.
   `DynamicWorkerTail` (attached in `runner.ts`) forwards them into Workers Logs

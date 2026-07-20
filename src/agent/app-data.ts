@@ -6,35 +6,55 @@ import {
   WorkspaceFilesystem,
   type WorkspaceFsError
 } from "@cloudflare/dofs";
-import type { FsDirent, FsFound, FsGrepMatch, FsNodeType, FsStat } from "../../types";
+import type {
+  AppDataStore,
+  AppFsStore,
+  Env,
+  FsDirent,
+  FsFound,
+  FsGrepMatch,
+  FsNodeType,
+  FsStat
+} from "../types";
 
 /**
- * AppStorageFacet — the isolated home for ALL of an app's runtime data.
+ * AppData — the isolated, TOP-LEVEL home for ALL of an app's runtime data.
  *
- * This is the Durable Object class that runs as a FACET beneath AppHost. It has
- * its OWN SQLite database, separate from AppHost's code/version store, so the
- * app's live data (a chatty writer) can never bloat or contend with the version
- * repository or the realtime coordinator. AppHost cannot read this database and
- * this facet cannot read AppHost's — isolation is enforced by the platform.
+ * This is a Durable Object keyed by the app instance (room id). It has its OWN
+ * SQLite database, separate from AppHost's code/version store, so the app's live
+ * data (a chatty writer) can never bloat or contend with the version repository
+ * or the realtime coordinator. AppHost cannot read this database and this DO
+ * cannot read AppHost's — isolation is enforced by the platform.
  *
  * It holds two things, both scoped by an app-supplied namespace:
  *   - a key/value STORE (`store*`) over its own `ctx.storage.sql`, and
  *   - a virtual FILESYSTEM (`fs*`) via @cloudflare/dofs over the same storage.
  *
+ * HOW IT'S REACHED (limitation #3 — 2 hops, no funneling)
+ * -------------------------------------------------------
  * The untrusted app never reaches this class directly. It asks the broker
  * (`env.SYSTEM.requestStore` / `requestFilesystem`), which validates + scopes the
- * request; AppHost then forwards the already-mediated call here. Facets add
- * isolation; the broker keeps policy. See src/capabilities/.
+ * request and hands back a capability stub. That stub (ScopedStore /
+ * ScopedFilesystem) then talks DIRECTLY to this DO by name —
+ * `env.APP_DATA.get(idFromName(instance))` — so the data path is exactly two
+ * hops (app → scoped stub → AppData) and NEVER passes through AppHost. AppHost is
+ * left free to serve code + the realtime coordinator without storage traffic
+ * contending on its input gate.
  *
- * This module is bundled standalone (with the tree-shaken dofs filesystem layer)
- * by scripts/build-facet.mjs and delivered through the Worker Loader — facets
- * must be obtained via `worker.getDurableObjectClass(...)`.
+ * This DO adds ISOLATION; the broker's scoped stubs keep POLICY
+ * (quota/scope/path-sanitisation). See src/capabilities/.
+ *
+ * (Earlier this logic lived in a Durable Object FACET beneath AppHost; that gave
+ * the same isolated SQLite but forced a third hop through AppHost, because a
+ * facet is only reachable via its parent's `ctx.facets.get`. Promoting it to a
+ * top-level DO drops that hop. The full history is in
+ * docs/cloudflare-sdk-usage.md.)
  */
 
 /**
  * Per-file byte cap for the filesystem. Deliberately modest (256 KiB): this is
  * for small, structured per-app data (notes, config, game history), NOT a blob
- * store. Large binaries belong in R2 via a future `requestBlobStore` broker hook.
+ * store. Large binaries belong in R2 via the `requestBlobStore` broker hook.
  */
 const MAX_FS_FILE_BYTES = 256 * 1024;
 
@@ -57,18 +77,18 @@ function direntType(node: {
   return "file";
 }
 
-export class AppStorageFacet extends DurableObject {
+export class AppData extends DurableObject<Env> implements AppDataStore, AppFsStore {
   #fs?: WorkspaceFilesystem;
 
-  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
+  constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    // Idempotent: this facet's OWN SQLite (isolated from the supervisor's).
+    // Idempotent: this DO's OWN SQLite (isolated from AppHost's code store).
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS app_data (scope TEXT NOT NULL, k TEXT NOT NULL, v TEXT NOT NULL, PRIMARY KEY (scope, k))"
     );
   }
 
-  // ── key/value store (invoked by ScopedStore over RPC via AppHost) ──
+  // ── key/value store (invoked by ScopedStore over RPC) ──
 
   async storeGet(scope: string, key: string): Promise<string | null> {
     const rows = this.ctx.storage.sql
@@ -110,7 +130,7 @@ export class AppStorageFacet extends DurableObject {
 
   /**
    * Atomically add `delta` to a numeric value and return the new total. A
-   * missing key starts at 0. This whole method runs under the facet's input gate
+   * missing key starts at 0. This whole method runs under the DO's input gate
    * (no `await` splits it), so concurrent increments can't lose updates — the
    * fix for the read-modify-write race on the plain HTTP path (limitation #2).
    */
@@ -165,10 +185,10 @@ export class AppStorageFacet extends DurableObject {
     return true;
   }
 
-  // ── filesystem (invoked by ScopedFilesystem over RPC via AppHost) ──
+  // ── filesystem (invoked by ScopedFilesystem over RPC) ──
   //
   // Backed by @cloudflare/dofs: a SQLite-backed virtual filesystem living in
-  // THIS facet's own storage (the vfs_* tables sit beside our app_data table).
+  // THIS DO's own storage (the vfs_* tables sit beside our app_data table).
   // Only the local filesystem layer is used (Database + WorkspaceFilesystem);
   // dofs's sync/RPC/git machinery is tree-shaken out at bundle time.
   //

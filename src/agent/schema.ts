@@ -6,9 +6,10 @@ import type { AppFile } from "../templates/types";
  * Three tables live in the Agent's own SQLite:
  *   - files:    the source code, one row per file per version
  *   - versions: the history list (enables rollback)
- *   - app_data: ONLY the realtime engine's `__room__` state (the coordinator's
- *               own state). The app's OWN key/value + filesystem data now lives
- *               in the AppStorageFacet's isolated SQLite, not here.
+ *   - app_data: ONLY framework-owned scopes — the realtime engine's `__room__`
+ *               state and the trusted egress `__egress__` allowlist. The app's
+ *               OWN key/value + filesystem data lives in the separate `AppData`
+ *               DO's isolated SQLite (src/agent/app-data.ts), not here.
  *
  * Keeping the SQL in one place lets the Agent read like intentions
  * ("save a version", "get live files") instead of raw queries.
@@ -166,8 +167,9 @@ export function pruneVersions(
   return doomed.length;
 }
 
-// ── app_data (now only the realtime coordinator's __room__ state; the app's
-//    own store/filesystem moved to the AppStorageFacet) ──
+// ── app_data (framework-owned scopes only: the realtime coordinator's __room__
+//    state + the egress __egress__ allowlist; the app's own store/filesystem
+//    live in the separate AppData DO, src/agent/app-data.ts) ──
 
 export function appDataGet(
   agent: SqlAgent,

@@ -5,7 +5,7 @@ import type { Env } from "../types";
  * A private BLOB store handed to an app by the broker (`requestBlobStore`).
  *
  * Unlike ScopedStore/ScopedFilesystem (small structured data in the app's
- * facet SQLite), this is for LARGE binary objects — images, audio, exports —
+ * AppData DO SQLite), this is for LARGE binary objects — images, audio, exports —
  * backed by R2. It is still a capability: the app only reaches it because the
  * broker minted the stub, and every key is confined to a per-app, per-namespace
  * prefix (`<instance>/<namespace>/…`) so one app can never see another's blobs.

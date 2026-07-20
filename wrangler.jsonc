@@ -16,18 +16,26 @@
   // Dynamic Worker Loader: lets the host load app code at runtime.
   "worker_loaders": [{ "binding": "LOADER" }],
 
-  // Durable Objects: one AppHost per room (the mutable app + its versions), and
-  // one CodeAssistant per room (the Think-based agentic coding assistant). Both
-  // are keyed by the room id; the assistant reaches its room's AppHost by RPC.
+  // Durable Objects, all keyed by the room id:
+  //  - AppHost      : the mutable app + its versions (code) + realtime coordinator.
+  //  - CodeAssistant : the Think-based agentic coding assistant (reaches AppHost by RPC).
+  //  - AppData      : the app's isolated runtime data (key/value store + dofs
+  //                   filesystem), in its OWN SQLite. Reached DIRECTLY by the
+  //                   ScopedStore/ScopedFilesystem capability stubs — NOT through
+  //                   AppHost — so storage traffic never funnels through the code
+  //                   DO (limitation #3). It needs `nodejs_compat` (dofs uses
+  //                   node:crypto/node:events), which the worker already enables.
   "durable_objects": {
     "bindings": [
       { "name": "AppHost", "class_name": "AppHost" },
-      { "name": "CodeAssistant", "class_name": "CodeAssistant" }
+      { "name": "CodeAssistant", "class_name": "CodeAssistant" },
+      { "name": "APP_DATA", "class_name": "AppData" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["AppHost"] },
-    { "tag": "v2", "new_sqlite_classes": ["CodeAssistant"] }
+    { "tag": "v2", "new_sqlite_classes": ["CodeAssistant"] },
+    { "tag": "v3", "new_sqlite_classes": ["AppData"] }
   ],
 
   // Workers AI: used by the host-side AI author to rewrite app code.

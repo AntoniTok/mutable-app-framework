@@ -6,6 +6,7 @@ import { runApp } from "./agent/runner";
 // The Agent + capability entrypoints must be exported from the main module so
 // the runtime can instantiate them (DO) and mint stubs (WorkerEntrypoint).
 export { AppHost } from "./agent/app-host";
+export { AppData } from "./agent/app-data";
 export { CodeAssistant } from "./assistant/code-assistant";
 export { CapabilityBroker } from "./capabilities/broker";
 export { ScopedStore } from "./capabilities/scoped-store";
@@ -107,7 +108,8 @@ async function handlePreview(request: Request, env: Env): Promise<Response> {
     // Running out-of-DO lets us STREAM the app's response straight to the client
     // (SSE, large bodies) instead of buffering it through an RPC ArrayBuffer, and
     // keeps the app's HTTP data path off the single-threaded DO. Storage
-    // capabilities still call back into the DO/facet, mediated by the broker.
+    // capabilities call straight into the app's own AppData DO, mediated by the
+    // broker — never back through AppHost (limitation #3).
     const manifest = await agent.getRunManifest();
     if (manifest.files.length === 0) {
       return new Response("No app code yet.", {

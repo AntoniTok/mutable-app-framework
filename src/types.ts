@@ -1,4 +1,5 @@
 import type { AppHost } from "./agent/app-host";
+import type { AppData } from "./agent/app-data";
 import type { CodeAssistant } from "./assistant/code-assistant";
 
 /** Bindings available to the host worker (declared in wrangler.jsonc). */
@@ -6,6 +7,12 @@ export interface Env {
   AppHost: DurableObjectNamespace<AppHost>;
   /** The per-room agentic coding assistant (Think). One instance per room id. */
   CodeAssistant: DurableObjectNamespace<CodeAssistant>;
+  /**
+   * The app's isolated runtime data (key/value store + dofs filesystem), one DO
+   * per room id. Reached DIRECTLY by the ScopedStore/ScopedFilesystem stubs, so
+   * storage never funnels through AppHost (limitation #3).
+   */
+  APP_DATA: DurableObjectNamespace<AppData>;
   LOADER: WorkerLoader;
   AI: Ai;
   /** R2 bucket backing the app blob-store capability (broker.requestBlobStore). */
@@ -22,8 +29,9 @@ export interface Env {
 }
 
 /**
- * The subset of AppHost methods that capability stubs call back into over RPC.
- * Keeping this as a narrow interface avoids a circular import on the class.
+ * The subset of the AppData DO methods that the ScopedStore capability calls
+ * back into over RPC. Kept as a narrow interface for documentation; the concrete
+ * `AppData` class implements it.
  */
 export interface AppDataStore {
   storeGet(scope: string, key: string): Promise<string | null>;
@@ -31,9 +39,9 @@ export interface AppDataStore {
   storeDelete(scope: string, key: string): Promise<void>;
   storeList(scope: string): Promise<string[]>;
   /**
-   * Atomic read-modify-write primitives. Each is a SINGLE facet method, so it
-   * runs to completion under the facet DO's input gate — no lost updates even
-   * under concurrent HTTP requests (see limitation #2).
+   * Atomic read-modify-write primitives. Each is a SINGLE DO method, so it runs
+   * to completion under the AppData DO's input gate — no lost updates even under
+   * concurrent HTTP requests (see limitation #2).
    */
   storeIncr(scope: string, key: string, delta: number): Promise<number>;
   storeCas(
@@ -82,9 +90,9 @@ export interface FsFound {
 }
 
 /**
- * The subset of AppHost filesystem methods the ScopedFilesystem capability
- * calls back into over RPC. Backed by @cloudflare/dofs in the AppHost DO.
- * Every method is scoped by `namespace`.
+ * The subset of the AppData DO's filesystem methods the ScopedFilesystem
+ * capability calls back into over RPC. Backed by @cloudflare/dofs in the AppData
+ * DO. Every method is scoped by `namespace`.
  */
 export interface AppFsStore {
   fsReadFile(namespace: string, path: string): Promise<string | null>;

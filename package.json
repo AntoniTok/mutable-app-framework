@@ -4,11 +4,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:facet": "node scripts/build-facet.mjs",
-    "predev": "npm run build:facet",
-    "prestart": "npm run build:facet",
-    "predeploy": "npm run build:facet",
-    "pretypecheck": "npm run build:facet",
     "dev": "wrangler dev",
     "start": "wrangler dev",
     "deploy": "wrangler deploy",
