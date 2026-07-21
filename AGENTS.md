@@ -144,6 +144,13 @@ enforcement (no hot-path funnel). Add new limit fields there, not inline.
   change — it never talks to the app sandbox, only trusted host config. In edit
   mode it also opens a read-only `?spectate=1` WS to `/agents/app-host/<room>` to
   keep the header status/version live via `cf_agent_state` (see "Live status feed").
+- `public/architecture.html` — self-contained prose architecture reference
+  (overview, what runs the code, code-as-data, request/edit/realtime paths, the
+  DOs, capabilities, security), served at `/architecture`.
+- `public/architecture-diagrams.html` — two diagrams (the overall framework
+  structure + a single deployed room/lobby) with every part explicitly marked
+  ALWAYS vs OPTIONAL, served at `/architecture-diagrams` (cross-links
+  `/architecture`). Keep both pages in sync when the architecture changes.
 
 ## Multi-room
 

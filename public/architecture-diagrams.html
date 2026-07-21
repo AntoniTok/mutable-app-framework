@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Mutable App Framework — Architecture Diagrams</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2230; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #2f81f7; --ok: #3fb950;
+    --warn: #d29922; --danger: #f85149; --purple: #bc8cff; --cyan: #39c5cf;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    line-height: 1.55; font-size: 14px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { background: #0b0f14; border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; font-size: 12.5px; color: var(--cyan); }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 24px 96px; }
+
+  header.hero { border-bottom: 1px solid var(--border); padding-bottom: 24px; margin-bottom: 8px; }
+  header.hero h1 { font-size: 26px; margin: 0 0 6px; }
+  header.hero p { color: var(--muted); margin: 4px 0; max-width: 820px; }
+  .tag { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; border: 1px solid var(--border); color: var(--muted); margin-right: 6px; }
+  .crumb { font-size: 12.5px; color: var(--muted); margin-bottom: 18px; }
+
+  nav.toc { position: sticky; top: 0; background: rgba(13,17,23,.92); backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--border); padding: 10px 0; margin: 16px 0 28px; z-index: 5; }
+  nav.toc a { color: var(--muted); font-size: 12.5px; margin-right: 18px; white-space: nowrap; }
+  nav.toc a:hover { color: var(--text); }
+
+  section { margin: 48px 0; }
+  h2 { font-size: 19px; margin: 0 0 4px; border-top: 1px solid var(--border); padding-top: 24px; }
+  h2 .n { color: var(--accent); margin-right: 8px; }
+  h3 { font-size: 15px; color: var(--text); margin: 22px 0 8px; }
+  p.lead { color: var(--muted); margin: 6px 0 18px; max-width: 860px; }
+
+  .box { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; }
+
+  /* ── legends ─────────────────────────────────────────── */
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 12px 0 8px; font-size: 12px; color: var(--muted); align-items: center; }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: middle; border: 1px solid; }
+  .s-host { border-color: #1f6feb; background: #12244a; }
+  .s-do { border-color: var(--cyan); background: #0d2b2e; }
+  .s-cap { border-color: var(--purple); background: #241a3a; }
+  .s-sandbox { border-color: var(--danger); background: #2a1214; }
+  .s-data { border-color: var(--ok); background: #0e2a17; }
+  .s-ext { border-color: var(--warn); background: #2b2410; }
+  .s-solid { border: 2px solid var(--muted); background: transparent; }
+  .s-dashed { border: 2px dashed var(--muted); background: transparent; }
+
+  /* ── diagram scaffolding ─────────────────────────────── */
+  .diagram { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+  .layer { margin: 0 0 4px; }
+  .layer-label { font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px 2px; }
+  .row { display: grid; gap: 12px; }
+  .cols-1 { grid-template-columns: 1fr; }
+  .cols-2 { grid-template-columns: 1fr 1fr; }
+  .cols-3 { grid-template-columns: repeat(3, 1fr); }
+  .cols-4 { grid-template-columns: repeat(4, 1fr); }
+  .cols-5 { grid-template-columns: repeat(5, 1fr); }
+  @media (max-width: 900px) { .cols-3, .cols-4, .cols-5 { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 560px) { .cols-2, .cols-3, .cols-4, .cols-5 { grid-template-columns: 1fr; } }
+
+  .node { position: relative; border: 1px solid var(--border); border-radius: 10px; padding: 11px 12px 10px; background: var(--panel2); }
+  .node .t { font-weight: 700; font-size: 13px; padding-right: 46px; }
+  .node .d { color: var(--muted); font-size: 11.5px; margin-top: 4px; }
+  .node.host { border-color: #1f6feb; }
+  .node.do { border-color: var(--cyan); }
+  .node.sandbox { border-color: var(--danger); background: #2a1214; }
+  .node.cap { border-color: var(--purple); }
+  .node.data { border-color: var(--ok); }
+  .node.ext { border-color: var(--warn); }
+  /* the OPTIONAL overlay: dashed border + faded */
+  .node.opt { border-style: dashed; opacity: .82; }
+
+  /* the always/optional badge, top-right of every node */
+  .badge { position: absolute; top: 8px; right: 8px; font-size: 9px; font-weight: 700; letter-spacing: .05em;
+    padding: 2px 6px; border-radius: 20px; border: 1px solid; }
+  .badge.always { color: var(--ok); border-color: #1f5a30; background: #0e2a17; }
+  .badge.opt { color: var(--warn); border-color: #5a4a1f; background: #2b2410; }
+
+  .arrow { text-align: center; color: var(--muted); font-size: 13px; line-height: 1.2; padding: 8px 0 6px; }
+  .arrow b { color: var(--text); font-weight: 600; }
+  .arrow .lbl { display: inline-block; background: #0b0f14; border: 1px solid var(--border); border-radius: 20px; padding: 1px 10px; font-size: 11px; color: var(--muted); }
+
+  .subgroup { border: 1px dashed var(--border); border-radius: 10px; padding: 10px 10px 4px; }
+  .subgroup .cap { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: 0 0 8px 2px; }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12.5px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  td code { white-space: nowrap; }
+
+  .callout { border-left: 3px solid var(--accent); background: var(--panel); border-radius: 0 10px 10px 0; padding: 12px 16px; margin: 16px 0; }
+  .callout.warn { border-left-color: var(--warn); }
+  .callout .h { font-weight: 700; margin-bottom: 4px; }
+
+  .pill { font-size: 10px; font-weight: 700; letter-spacing: .04em; padding: 2px 7px; border-radius: 20px; border: 1px solid; }
+  .pill.always { color: var(--ok); border-color: #1f5a30; background: #0e2a17; }
+  .pill.opt { color: var(--warn); border-color: #5a4a1f; background: #2b2410; }
+  .muted { color: var(--muted); }
+  .small { font-size: 11.5px; color: var(--muted); }
+  .center { text-align: center; }
+  ul.tight { margin: 8px 0; padding-left: 20px; }
+  ul.tight li { margin: 4px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Mutable App Framework — Architecture Diagrams</h1>
+    <p>Two views of the same system. <b>Diagram 1</b> is the <em>framework</em> — every moving part and how they
+       relate. <b>Diagram 2</b> is one <em>deployed room</em> — the lobby that spawns it, the room page, and exactly
+       which pieces light up for a live app.</p>
+    <p style="margin-top:10px">Every box is marked
+      <span class="pill always">ALWAYS</span> (present for every room) or
+      <span class="pill opt">OPTIONAL</span> (created on demand — only if the app or the user needs it).</p>
+    <p style="margin-top:12px">
+      <span class="tag">Workers</span><span class="tag">Durable Objects</span><span class="tag">Worker Loader</span>
+      <span class="tag">Agents SDK</span><span class="tag">R2</span><span class="tag">Workers AI</span>
+    </p>
+  </header>
+
+  <div class="crumb">See also the prose walkthrough: <a href="/architecture">Architecture reference →</a></div>
+
+  <nav class="toc">
+    <a href="#convention">Convention</a>
+    <a href="#framework">1 · Framework structure</a>
+    <a href="#fw-table">— always vs optional</a>
+    <a href="#room">2 · A deployed room + lobby</a>
+    <a href="#room-table">— always vs optional</a>
+  </nav>
+
+  <!-- ─────────────────────────── CONVENTION ─────────────────────────── -->
+  <section id="convention">
+    <h2><span class="n">00</span>Reading the diagrams</h2>
+    <div class="box">
+      <h3 style="margin-top:0">Box colour = what kind of thing it is</h3>
+      <div class="legend">
+        <span><span class="swatch s-ext"></span>Browser / external / platform</span>
+        <span><span class="swatch s-host"></span>Entry Worker (trusted)</span>
+        <span><span class="swatch s-do"></span>Durable Object (trusted)</span>
+        <span><span class="swatch s-cap"></span>Capability stub (trusted)</span>
+        <span><span class="swatch s-sandbox"></span>Dynamic Worker (UNTRUSTED app)</span>
+        <span><span class="swatch s-data"></span>Isolated storage</span>
+      </div>
+      <h3>Border &amp; badge = whether it is always there</h3>
+      <div class="legend">
+        <span><span class="swatch s-solid"></span><span class="pill always">ALWAYS</span>&nbsp; solid border — exists for every room, no matter the app</span>
+      </div>
+      <div class="legend">
+        <span><span class="swatch s-dashed"></span><span class="pill opt">OPTIONAL</span>&nbsp; dashed border — instantiated lazily, only when an app calls the capability or the user opens the tool</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────────────────── DIAGRAM 1 ─────────────────────────── -->
+  <section id="framework">
+    <h2><span class="n">01</span>Framework structure — every part &amp; how they connect</h2>
+    <p class="lead">One Worker is the front door. It talks to trusted per-room Durable Objects and spawns the
+      untrusted app in a Dynamic Worker. Only <b>three</b> things are guaranteed to exist for any room: the
+      <b>Entry Worker</b>, the <b>AppHost</b> DO, and the <b>Dynamic Worker</b> that runs the code. Everything else is
+      pulled in on demand.</p>
+
+    <div class="diagram">
+
+      <!-- clients -->
+      <div class="layer">
+        <div class="layer-label">Clients — browser</div>
+        <div class="row cols-4">
+          <div class="node ext"><span class="badge always">ALWAYS</span><div class="t">Lobby</div><div class="d"><code>index.html</code> — pick a template, create/join a room</div></div>
+          <div class="node ext"><span class="badge always">ALWAYS</span><div class="t">Room page</div><div class="d"><code>room.html</code> — live app + editor chrome</div></div>
+          <div class="node ext opt"><span class="badge opt">OPT</span><div class="t">AI chat (WS)</div><div class="d">Only when the Chat panel is open</div></div>
+          <div class="node ext opt"><span class="badge opt">OPT</span><div class="t">Realtime client (WS)</div><div class="d">Only for multiplayer apps</div></div>
+        </div>
+      </div>
+
+      <div class="arrow"><span class="lbl">HTTPS · WebSocket</span> &nbsp;↓</div>
+
+      <!-- entry worker -->
+      <div class="layer">
+        <div class="layer-label">Front door — trusted</div>
+        <div class="row cols-1">
+          <div class="node host"><span class="badge always">ALWAYS</span>
+            <div class="t">Entry Worker · <code>src/server.ts</code></div>
+            <div class="d">Routes <code>/api/*</code> · <code>/preview/*</code> (streams the live app) · <code>/agents/*</code> (WS to DOs) · serves static assets. Resolves the room from <code>?room=</code>.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="arrow">
+        <span class="lbl">getAgentByName(room)</span> &nbsp;↓&nbsp; trusted per-room Durable Objects &nbsp;↓&nbsp; <span class="lbl">idFromName(room)</span>
+      </div>
+
+      <!-- DOs -->
+      <div class="layer">
+        <div class="layer-label">Durable Objects — one set per room</div>
+        <div class="row cols-2" style="margin-bottom:12px">
+          <div class="node do"><span class="badge always">ALWAYS</span>
+            <div class="t">AppHost <span class="muted">· Agent</span></div>
+            <div class="d">The heart. Holds the app CODE (files/versions/builds), the realtime coordinator, and all trusted policy (egress / limits / secrets / email). The only promote path (<code>setFiles</code>, build-gated).</div>
+          </div>
+          <div class="node do opt"><span class="badge opt">OPT</span>
+            <div class="t">CodeAssistant <span class="muted">· Think</span></div>
+            <div class="d">The AI coding loop + per-room memory. Spun up only when you edit with AI. Edits code ONLY via <code>AppHost.setFiles</code>.</div>
+          </div>
+        </div>
+        <div class="row cols-3">
+          <div class="node do opt"><span class="badge opt">OPT</span><div class="t">AppData <span class="muted">· DO</span></div><div class="d">Key/value store + dofs filesystem, own SQLite. Exists once the app calls <code>requestStore</code>/<code>requestFilesystem</code>.</div></div>
+          <div class="node do opt"><span class="badge opt">OPT</span><div class="t">AppSql <span class="muted">· DO</span></div><div class="d">Relational SQLite. Exists once the app calls <code>requestSql</code>.</div></div>
+          <div class="node do opt"><span class="badge opt">OPT</span><div class="t">AppScheduler <span class="muted">· DO</span></div><div class="d">Task queue (SQLite + one alarm). Exists once the app calls <code>requestScheduler</code>.</div></div>
+        </div>
+      </div>
+
+      <div class="arrow">
+        AppHost spawns the app &nbsp;·&nbsp; <span class="lbl">env.LOADER.get(app-&lt;room&gt;-&lt;hash&gt;)</span> &nbsp;↓&nbsp; env = <code>{ SYSTEM }</code> only
+      </div>
+
+      <!-- sandbox -->
+      <div class="layer">
+        <div class="layer-label">The sandbox — untrusted</div>
+        <div class="row cols-2">
+          <div class="node sandbox"><span class="badge always">ALWAYS</span>
+            <div class="t">Dynamic Worker — the app</div>
+            <div class="d">Runs the code-as-data in its own V8 isolate. <code>globalOutbound: null</code>, per-run cpu/subrequest limits, the ONLY binding is <code>env.SYSTEM</code>. This is what "runs the app" — always present when a request/action/task fires.</div>
+          </div>
+          <div class="node cap"><span class="badge always">ALWAYS</span>
+            <div class="t">Capability broker — <code>env.SYSTEM</code></div>
+            <div class="d">Injected into every run. The app must <em>ask</em> for power: <code>request*()</code> mints a narrow, per-room stub. The broker is always there; each individual stub below is optional.</div>
+          </div>
+        </div>
+
+        <div class="subgroup" style="margin-top:12px">
+          <div class="cap">scoped capability stubs — minted on demand</div>
+          <div class="row cols-4">
+            <div class="node cap opt"><span class="badge opt">OPT</span><div class="t">ScopedStore / Filesystem</div><div class="d">→ AppData DO (direct)</div></div>
+            <div class="node cap opt"><span class="badge opt">OPT</span><div class="t">ScopedSql</div><div class="d">→ AppSql DO (direct)</div></div>
+            <div class="node cap opt"><span class="badge opt">OPT</span><div class="t">ScopedScheduler</div><div class="d">→ AppScheduler DO (direct)</div></div>
+            <div class="node cap opt"><span class="badge opt">OPT</span><div class="t">ScopedRoom</div><div class="d">→ AppHost live sockets (RPC)</div></div>
+            <div class="node cap opt"><span class="badge opt">OPT</span><div class="t">ScopedBlobStore</div><div class="d">→ R2</div></div>
+            <div class="node cap opt"><span class="badge opt">OPT</span><div class="t">ScopedFetcher</div><div class="d">→ mediated egress</div></div>
+            <div class="node cap opt"><span class="badge opt">OPT</span><div class="t">ScopedSecrets</div><div class="d">→ AppHost <code>__secrets__</code></div></div>
+            <div class="node cap opt"><span class="badge opt">OPT</span><div class="t">ScopedEmail</div><div class="d">→ EMAIL binding</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="arrow"><span class="lbl">stubs reach storage/platform directly — never back through AppHost (limitation #3)</span> &nbsp;↓</div>
+
+      <!-- platform -->
+      <div class="layer">
+        <div class="layer-label">Platform &amp; external services</div>
+        <div class="row cols-5">
+          <div class="node data"><span class="badge always">ALWAYS</span><div class="t">Worker Loader</div><div class="d"><code>LOADER</code> — creates the app isolate</div></div>
+          <div class="node ext"><span class="badge always">ALWAYS</span><div class="t">Workers Logs</div><div class="d">Tail worker re-emits each app run</div></div>
+          <div class="node data opt"><span class="badge opt">OPT</span><div class="t">R2 · BLOBS</div><div class="d">Large binaries</div></div>
+          <div class="node ext opt"><span class="badge opt">OPT</span><div class="t">Email · <code>send_email</code></div><div class="d">Transactional send</div></div>
+          <div class="node ext opt"><span class="badge opt">OPT</span><div class="t">Workers AI</div><div class="d">Model for the assistant</div></div>
+        </div>
+        <div class="row cols-1" style="margin-top:12px">
+          <div class="node ext opt"><span class="badge opt">OPT</span><div class="t">Allow-listed external hosts</div><div class="d">Reachable ONLY through <code>ScopedFetcher</code> (SSRF-safe, per-app allowlist). The app sandbox itself has no network.</div></div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="callout">
+      <div class="h">The one idea</div>
+      Trusted framework code (Worker + DOs + stubs) holds all the power; the untrusted app starts with a single handle,
+      <code>env.SYSTEM</code>, and must ask for everything. That is why almost every box is <span class="pill opt">OPTIONAL</span> —
+      the app pulls a capability in only when it uses it, and a room that uses nothing but <code>fetch</code> runs on just
+      the three <span class="pill always">ALWAYS</span> pieces.
+    </div>
+
+    <div class="callout warn">
+      <div class="h">Why so many separate DOs (and not facets)?</div>
+      AppData / AppSql / AppScheduler could each have been a <b>facet</b> under AppHost — same isolation, but a facet has
+      <b>no name</b>, so every call would route <em>through</em> AppHost (3 hops) and contend on the code+realtime DO's
+      single input gate. A top-level DO is <b>addressable by name</b>, so the capability stub reaches it <b>directly</b>
+      (2 hops) and keeps AppHost off the storage hot path (limitation #3). Rule of thumb: <em>parent-private sub-store →
+      facet; anything other callers hit directly → top-level DO.</em>
+      See the <a href="/architecture#dos">Durable Objects section</a> for the full argument.
+    </div>
+  </section>
+
+  <!-- ─────────────────────────── FW TABLE ─────────────────────────── -->
+  <section id="fw-table">
+    <h2><span class="n">01·b</span>Framework — always vs optional, explicitly</h2>
+    <table>
+      <thead><tr><th>Part</th><th>Status</th><th>When it exists / what turns it on</th></tr></thead>
+      <tbody>
+        <tr><td>Entry Worker (<code>server.ts</code>)</td><td><span class="pill always">ALWAYS</span></td><td>The deployed Worker itself — the front door for every request.</td></tr>
+        <tr><td>Lobby (<code>index.html</code>)</td><td><span class="pill always">ALWAYS</span></td><td>Framework-level page, not per-room; served at <code>/</code>.</td></tr>
+        <tr><td>Room page (<code>room.html</code>)</td><td><span class="pill always">ALWAYS</span></td><td>Served for any room id.</td></tr>
+        <tr><td><code>AppHost</code> DO</td><td><span class="pill always">ALWAYS</span></td><td>Every room has one — it is where the code lives.</td></tr>
+        <tr><td>Worker Loader + Dynamic Worker</td><td><span class="pill always">ALWAYS</span></td><td>Every preview/action/task runs the app in a fresh isolate.</td></tr>
+        <tr><td>Capability broker (<code>env.SYSTEM</code>)</td><td><span class="pill always">ALWAYS</span></td><td>Injected into every app run (even if the app asks for nothing).</td></tr>
+        <tr><td>Workers Logs (tail worker)</td><td><span class="pill always">ALWAYS</span></td><td>Attached to every run for observability.</td></tr>
+        <tr><td><code>CodeAssistant</code> DO</td><td><span class="pill opt">OPTIONAL</span></td><td>Only when you edit with AI (open the Chat panel). Manual edits skip it entirely.</td></tr>
+        <tr><td><code>AppData</code> DO</td><td><span class="pill opt">OPTIONAL</span></td><td>App calls <code>requestStore</code> or <code>requestFilesystem</code>.</td></tr>
+        <tr><td><code>AppSql</code> DO</td><td><span class="pill opt">OPTIONAL</span></td><td>App calls <code>requestSql</code>.</td></tr>
+        <tr><td><code>AppScheduler</code> DO</td><td><span class="pill opt">OPTIONAL</span></td><td>App calls <code>requestScheduler</code> / exports <code>onSchedule</code>.</td></tr>
+        <tr><td>R2 (<code>BLOBS</code>)</td><td><span class="pill opt">OPTIONAL</span></td><td>App calls <code>requestBlobStore</code>.</td></tr>
+        <tr><td>Email (<code>send_email</code>)</td><td><span class="pill opt">OPTIONAL</span></td><td>App calls <code>requestEmail</code> + a policy is set.</td></tr>
+        <tr><td>Mediated egress + Workers AI</td><td><span class="pill opt">OPTIONAL</span></td><td>Egress: <code>requestFetch</code> + allowlist. AI: only the assistant uses the model.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ─────────────────────────── DIAGRAM 2 ─────────────────────────── -->
+  <section id="room">
+    <h2><span class="n">02</span>A deployed room + lobby — the instance view</h2>
+    <p class="lead">This is what actually exists once a user creates a room. The lobby is a framework singleton; the room
+      page and its <code>AppHost</code> are always there. The editor tools, the realtime channel, the AI, and the extra
+      data DOs appear only as the app or the user reaches for them.</p>
+
+    <div class="diagram">
+
+      <!-- lobby -->
+      <div class="layer">
+        <div class="layer-label">Step 0 — the lobby (framework singleton)</div>
+        <div class="row cols-1">
+          <div class="node ext"><span class="badge always">ALWAYS</span>
+            <div class="t">Lobby · <code>/</code></div>
+            <div class="d">Reads <code>GET /api/templates</code> into a picker → <code>POST /api/create?room=&lt;id&gt;</code> <code>{template}</code> seeds the chosen app → navigates to the room. One lobby serves every room.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="arrow"><b>create &amp; navigate</b> &nbsp;↓&nbsp; <span class="lbl">/room.html?room=&lt;id&gt;</span></div>
+
+      <!-- the room, browser side -->
+      <div class="layer">
+        <div class="layer-label">Step 1 — the room page (browser)</div>
+        <div class="box" style="background:var(--panel2); border-style:solid;">
+          <div class="row cols-2" style="margin-bottom:12px">
+            <div class="node ext"><span class="badge always">ALWAYS</span><div class="t">Live app iframe</div><div class="d">Renders <code>/preview/?room=&lt;id&gt;</code> — the running app, shown by default.</div></div>
+            <div class="node ext opt"><span class="badge opt">OPT</span><div class="t">Live status feed (WS)</div><div class="d">Read-only <code>?spectate=1</code> WS to keep the header version/status live.</div></div>
+          </div>
+          <div class="subgroup">
+            <div class="cap">editor chrome — hidden until you press "Edit"</div>
+            <div class="row cols-4">
+              <div class="node ext opt"><span class="badge opt">OPT</span><div class="t">Code panel</div><div class="d">→ <code>POST /api/files</code></div></div>
+              <div class="node ext opt"><span class="badge opt">OPT</span><div class="t">Chat panel</div><div class="d">→ CodeAssistant (WS)</div></div>
+              <div class="node ext opt"><span class="badge opt">OPT</span><div class="t">Resources</div><div class="d">→ <code>/api/resources</code>, limits/egress/secrets/email</div></div>
+              <div class="node ext opt"><span class="badge opt">OPT</span><div class="t">History</div><div class="d">→ versions / rollback</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="arrow"><span class="lbl">HTTPS /api · /preview</span> &nbsp;·&nbsp; <span class="lbl">WS /agents</span> &nbsp;↓</div>
+
+      <!-- the room's trusted core -->
+      <div class="layer">
+        <div class="layer-label">Step 2 — the room's trusted core (one AppHost)</div>
+        <div class="row cols-2">
+          <div class="node do"><span class="badge always">ALWAYS</span>
+            <div class="t">AppHost <span class="muted">· this room</span></div>
+            <div class="d">Serves code to <code>/preview</code>, owns the realtime coordinator + policy, is the only promote path. Seeded lazily with the chosen template on first touch.</div>
+          </div>
+          <div class="node do opt"><span class="badge opt">OPT</span>
+            <div class="t">CodeAssistant <span class="muted">· this room</span></div>
+            <div class="d">Present only while you're editing with AI. Its tools drive this room's AppHost by RPC.</div>
+          </div>
+        </div>
+
+        <div class="subgroup" style="margin-top:12px">
+          <div class="cap">realtime coordinator (inside AppHost) — active only for multiplayer apps</div>
+          <div class="row cols-3">
+            <div class="node do opt"><span class="badge opt">OPT</span><div class="t">WebSockets + seats</div><div class="d">Only if the app exports <code>applyAction</code> &amp; a client connects.</div></div>
+            <div class="node do opt"><span class="badge opt">OPT</span><div class="t"><code>__room__</code> state</div><div class="d">The authoritative reducer state.</div></div>
+            <div class="node do opt"><span class="badge opt">OPT</span><div class="t">Per-viewer <code>view()</code></div><div class="d">Only if the app hides information (e.g. poker).</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="arrow">runs the live version &nbsp;·&nbsp; <span class="lbl">env.LOADER.get(...)</span> &nbsp;↓</div>
+
+      <!-- the running app -->
+      <div class="layer">
+        <div class="layer-label">Step 3 — the running app (sandbox)</div>
+        <div class="row cols-2">
+          <div class="node sandbox"><span class="badge always">ALWAYS</span>
+            <div class="t">Dynamic Worker — this app</div>
+            <div class="d">Required export: <code>fetch(request, env)</code> + an HTML page. Optional exports: <code>applyAction</code>/<code>view</code>/<code>seats</code> (realtime), <code>onSchedule</code> (tasks), <code>onUpgrade</code>/<code>migrate</code> (data migrations).</div>
+          </div>
+          <div class="node cap"><span class="badge always">ALWAYS</span>
+            <div class="t"><code>env.SYSTEM</code> broker</div>
+            <div class="d">The app's single handle. Everything below is pulled in only if this app uses it.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="arrow"><span class="lbl">request*() → direct to storage/platform</span> &nbsp;↓</div>
+
+      <!-- per-app resources -->
+      <div class="layer">
+        <div class="layer-label">Step 4 — this app's resources (only what it uses)</div>
+        <div class="row cols-3">
+          <div class="node do opt"><span class="badge opt">OPT</span><div class="t">AppData DO</div><div class="d">store / filesystem — own SQLite</div></div>
+          <div class="node do opt"><span class="badge opt">OPT</span><div class="t">AppSql DO</div><div class="d">relational tables — own SQLite</div></div>
+          <div class="node do opt"><span class="badge opt">OPT</span><div class="t">AppScheduler DO</div><div class="d">tasks + alarm — own SQLite</div></div>
+          <div class="node data opt"><span class="badge opt">OPT</span><div class="t">R2 · BLOBS</div><div class="d">large binaries</div></div>
+          <div class="node ext opt"><span class="badge opt">OPT</span><div class="t">Email</div><div class="d">mediated send</div></div>
+          <div class="node ext opt"><span class="badge opt">OPT</span><div class="t">External hosts</div><div class="d">mediated egress (allowlist)</div></div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="callout warn">
+      <div class="h">Two rooms are fully isolated</div>
+      Every DO here is keyed by the room id, so room <code>A</code> can never see room <code>B</code>'s code, data, or realtime
+      state. Create a second room and you get a second, independent copy of this whole picture — sharing only the one
+      Entry Worker and the one lobby.
+    </div>
+  </section>
+
+  <!-- ─────────────────────────── ROOM TABLE ─────────────────────────── -->
+  <section id="room-table">
+    <h2><span class="n">02·b</span>A room's runtime — always vs optional, explicitly</h2>
+    <table>
+      <thead><tr><th>Piece</th><th>Status</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>The lobby</td><td><span class="pill always">ALWAYS</span></td><td>Shared framework singleton, not owned by the room.</td></tr>
+        <tr><td>Room page + live app iframe</td><td><span class="pill always">ALWAYS</span></td><td>The default view of any room.</td></tr>
+        <tr><td>This room's <code>AppHost</code></td><td><span class="pill always">ALWAYS</span></td><td>Holds the code; seeded lazily from the chosen template.</td></tr>
+        <tr><td>Dynamic Worker running the app</td><td><span class="pill always">ALWAYS</span></td><td>Every <code>/preview</code> hit runs it.</td></tr>
+        <tr><td>App export <code>fetch</code> + HTML page</td><td><span class="pill always">ALWAYS</span></td><td>Required by the runtime contract.</td></tr>
+        <tr><td>Editor chrome (Code / Chat / Resources / History)</td><td><span class="pill opt">OPTIONAL</span></td><td>Revealed by the "Edit" button; a player never sees it.</td></tr>
+        <tr><td>Realtime: WS, seats, <code>__room__</code> state</td><td><span class="pill opt">OPTIONAL</span></td><td>Only multiplayer apps (those exporting <code>applyAction</code>). A pure HTTP app like <code>counter</code> uses none of it.</td></tr>
+        <tr><td>Per-viewer <code>view()</code></td><td><span class="pill opt">OPTIONAL</span></td><td>Only apps with hidden information.</td></tr>
+        <tr><td><code>CodeAssistant</code></td><td><span class="pill opt">OPTIONAL</span></td><td>Only while editing with AI.</td></tr>
+        <tr><td>AppData / AppSql / AppScheduler / R2 / Email / egress</td><td><span class="pill opt">OPTIONAL</span></td><td>Each appears the moment the app calls the matching <code>request*()</code>.</td></tr>
+        <tr><td>App exports <code>onSchedule</code> / <code>onUpgrade</code> / <code>migrate</code></td><td><span class="pill opt">OPTIONAL</span></td><td>Tasks / data-migration / state-migration hooks — apps opt in.</td></tr>
+      </tbody>
+    </table>
+
+    <p class="small center" style="margin-top:36px">
+      Generated architecture reference · see <a href="/architecture">the prose walkthrough</a>, <code>README.md</code> and
+      <code>AGENTS.md</code> for the authoritative, always-current details.
+    </p>
+  </section>
+
+</div>
+</body>
+</html>

@@ -115,6 +115,7 @@
   </header>
 
   <nav class="toc">
+    <a href="/architecture-diagrams" style="color:var(--accent)">◇ Diagrams</a>
     <a href="#overview">Overview</a>
     <a href="#runner">What runs the code</a>
     <a href="#codeasdata">Code as data</a>
@@ -381,6 +382,48 @@ builds:    (hash=<span class="s">"a1b2…"</span>, main=<span class="s">"…esbu
       (<code>idFromName(instance)</code>) — two hops, never through AppHost. This keeps storage traffic off the code DO's
       single-threaded input gate. AppHost pushes trusted caps down to them (e.g. <code>setLimits → setSqlLimits</code>);
       the stubs still validate/quota every call.
+    </div>
+
+    <h3>Why separate DOs, not facets?</h3>
+    <p class="lead">The obvious way to give a DO a second isolated SQLite is a <b>Durable Object facet</b> — a child
+      store beneath a parent DO. We started there (app data was an <code>AppStorageFacet</code> under AppHost) and moved
+      off it on purpose. A facet and a top-level DO give the <b>same isolation</b> (own SQLite, own input gate,
+      platform-enforced) — they differ on <b>one axis: addressability</b>, and that single difference decides it.</p>
+
+    <div class="grid cols-2">
+      <div class="box">
+        <h3 style="margin-top:0">A facet has <span style="color:var(--danger)">no name</span></h3>
+        <ul class="tight">
+          <li>Reachable <b>only through its parent</b> (<code>parent.ctx.facets.get(...)</code>).</li>
+          <li>So every <code>store.get</code> / <code>sql.query</code> becomes <b>3 hops</b>: <code>app → stub → AppHost → facet</code>.</li>
+          <li>AppHost — the single per-room <b>code + realtime</b> DO — sits on the hot path of every storage call, contending on its one input gate. That <em>is</em> limitation #3.</li>
+        </ul>
+      </div>
+      <div class="box">
+        <h3 style="margin-top:0">A top-level DO <span style="color:var(--ok)">has a name</span></h3>
+        <ul class="tight">
+          <li>Any binding holder reaches it with <code>idFromName(room)</code>.</li>
+          <li>So the stub calls it <b>directly</b> — <b>2 hops</b>: <code>app → stub → AppData/AppSql/AppScheduler</code>.</li>
+          <li>AppHost leaves the storage path entirely; storage traffic never wakes or serializes the code DO.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="callout">
+      <div class="h">The decision rule</div>
+      <b>Who calls it?</b> Only the parent, and the store belongs to that parent → <b>facet</b> (the parent hop is free).
+      Anyone <em>else</em> on a hot path → <b>top-level DO</b> (a facet would force them through the parent = a funnel).
+      All three data DOs sit on the app's per-request path, so all three are top-level. (<code>CodeAssistant</code> is
+      separate for an orthogonal reason: it <code>extends Think</code>, and AppHost already <code>extends Agent</code> —
+      single inheritance forbids one class being both.)
+    </div>
+
+    <div class="callout warn">
+      <div class="h">The platform agrees now</div>
+      Since we migrated, Cloudflare dropped <code>ctx.facets</code> from the public Durable Objects API and introduced
+      <code>ctx.exports</code> — auto-generated namespace bindings for top-level DO classes, i.e. <em>named, directly
+      addressable</em> second stores. That's exactly the pattern we landed on. Full write-up:
+      <code>docs/cloudflare-sdk-usage.md</code> → "Why NOT a facet".
     </div>
   </section>
 

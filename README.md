@@ -42,6 +42,15 @@ Three layers, two of them swappable:
 3. **App templates** (swappable) — the actual apps, incl. their own UI. Behind
    the `AppTemplate` interface + the runtime contract.
 
+> **See it visually.** Two architecture pages ship with the framework and are
+> served by the dev server:
+> [**`/architecture`**](public/architecture.html) — a prose walkthrough of every
+> path (request, edit, realtime, capabilities, security); and
+> [**`/architecture-diagrams`**](public/architecture-diagrams.html) — two diagrams
+> (the overall **framework structure** and a single **deployed room + lobby**) with
+> every part marked *always present* vs *optional*. Open them on the running dev
+> server, or read the HTML in `public/`.
+
 ### Key idea: the app is untrusted
 
 The app's code may be AI-written, so it runs in a **Dynamic Worker** with:
@@ -265,6 +274,13 @@ public/
                                /room.html?room=<id>. The Resources panel reads one
                                GET /api/resources snapshot and writes through the
                                /api/{limits,egress,secrets,email} routes.
+  architecture.html            Prose architecture reference (overview, what runs
+                               the code, code-as-data, request/edit/realtime paths,
+                               the DOs, capabilities, security). Served at
+                               /architecture.
+  architecture-diagrams.html   Two diagrams — the framework structure and a single
+                               deployed room/lobby — each box marked always vs
+                               optional. Served at /architecture-diagrams.
 
 wrangler.jsonc                 Bindings: AppHost + CodeAssistant + AppData +
                                AppScheduler + AppSql DOs, LOADER, AI, BLOBS (R2),
