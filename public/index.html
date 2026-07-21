@@ -36,6 +36,13 @@
       .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
       .hint a { color: var(--accent); text-decoration: none; }
       .err { color: #f85149; font-size: 12px; margin: 8px 0 0; min-height: 14px; }
+      label.fld { display: block; font-size: 12px; color: var(--muted); margin: 0 0 6px; }
+      select {
+        width: 100%; background: var(--bg); color: var(--text);
+        border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+        font-family: inherit; font-size: 14px; margin-bottom: 10px;
+      }
+      .caps { color: var(--muted); font-size: 11px; margin: 0 0 12px; min-height: 14px; }
     </style>
   </head>
   <body>
@@ -49,9 +56,12 @@
 
       <div class="block">
         <h2>Create a room</h2>
+        <label class="fld" for="template">App</label>
+        <select id="template"><option value="">Loading apps…</option></select>
+        <p class="caps" id="caps"></p>
         <div class="row">
           <button id="create">Create room</button>
-          <span class="hint">Generates a random id and drops you into the game.</span>
+          <span class="hint">Generates a random id and seeds it with the chosen app.</span>
         </div>
       </div>
 
@@ -93,8 +103,53 @@
         return "/room?room=" + encodeURIComponent(room);
       }
 
-      $("create").onclick = () => {
-        location.href = roomUrl(randomRoom());
+      // Populate the app picker from the server's template catalog.
+      let TEMPLATES = [];
+      async function loadTemplates() {
+        try {
+          const r = await fetch("/api/templates");
+          const { templates } = await r.json();
+          TEMPLATES = templates || [];
+          const sel = $("template");
+          sel.innerHTML = "";
+          for (const t of TEMPLATES) {
+            const o = document.createElement("option");
+            o.value = t.id;
+            o.textContent = t.label + (t.default ? " (default)" : "");
+            if (t.default) o.selected = true;
+            sel.appendChild(o);
+          }
+          showCaps();
+        } catch {
+          $("template").innerHTML = '<option value="">(default app)</option>';
+        }
+      }
+      function showCaps() {
+        const t = TEMPLATES.find((x) => x.id === $("template").value);
+        $("caps").textContent =
+          t && t.declares && t.declares.length
+            ? "capabilities: " + t.declares.join(", ")
+            : "";
+      }
+      $("template").addEventListener("change", showCaps);
+      loadTemplates();
+
+      $("create").onclick = async () => {
+        const room = randomRoom();
+        const template = $("template").value || undefined;
+        $("create").disabled = true;
+        try {
+          // Seed the room with the chosen app BEFORE navigating, so the room's
+          // first-touch seed uses the picked template (not the default).
+          await fetch("/api/create?room=" + encodeURIComponent(room), {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ template })
+          });
+        } catch {
+          // Non-fatal: the room still opens; it just falls back to the default app.
+        }
+        location.href = roomUrl(room);
       };
 
       $("joinForm").addEventListener("submit", (e) => {

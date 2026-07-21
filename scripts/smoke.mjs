@@ -1,19 +1,23 @@
 // Runtime smoke test for the mutable-app-framework.
 //
-// Because the framework hosts ONE app at a time, this script auto-detects which
-// app is live (via GET /api/state → templateId) and runs the matching checks
-// against a FRESH room (so stale .wrangler rooms can't interfere). It needs no
-// dependencies — Node 22+ provides global fetch and WebSocket.
+// App selection is per-room at runtime, so this script CREATES a FRESH room seeded
+// with the app under test (POST /api/create), then auto-detects the seeded app
+// (via GET /api/state → templateId) and runs the matching checks. A fresh room
+// with no template seeds the default (blackjack), which has no suite — so pass the
+// app you want to test. No dependencies — Node 22+ provides global fetch/WebSocket.
 //
 // Usage (dev server must be running):
-//   npm run dev            # in one terminal
-//   npm run smoke          # in another  (defaults to http://localhost:8787)
-//   npm run smoke -- http://localhost:8788
+//   npm run dev                       # in one terminal
+//   npm run smoke -- counter          # in another (counter | tictactoe | poker)
+//   npm run smoke -- poker http://localhost:8788
+//   SMOKE_TEMPLATE=tictactoe npm run smoke
 //
-// To verify all three apps: set DEFAULT_TEMPLATE_ID in src/templates/registry.ts
-// to each of poker | tictactoe | counter, restart `npm run dev`, and re-run.
+// To verify all three, run it three times with counter | tictactoe | poker.
 
-const BASE = (process.argv[2] || process.env.SMOKE_URL || "http://localhost:8787").replace(/\/$/, "");
+// Args in any order: one that looks like a URL is the base, the other the template.
+const ARGS = process.argv.slice(2);
+const BASE = (ARGS.find((a) => /^https?:\/\//.test(a)) || process.env.SMOKE_URL || "http://localhost:8787").replace(/\/$/, "");
+const TEMPLATE = ARGS.find((a) => !/^https?:\/\//.test(a)) || process.env.SMOKE_TEMPLATE || "";
 const ROOM = `smoke_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
 let pass = 0;
@@ -32,6 +36,19 @@ async function apiGet(path) {
   let json;
   try { json = JSON.parse(text); } catch { json = null; }
   return { status: res.status, text, json, headers: res.headers };
+}
+
+async function apiPost(path, body) {
+  const url = `${BASE}${path}${path.includes("?") ? "&" : "?"}room=${encodeURIComponent(ROOM)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body ?? {})
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = null; }
+  return { status: res.status, text, json };
 }
 
 function wsUrl() {
@@ -180,9 +197,11 @@ function seatHole(frame, seat) {
 // ── main ───────────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log(`smoke: ${BASE}  room=${ROOM}`);
+  console.log(`smoke: ${BASE}  room=${ROOM}  template=${TEMPLATE || "(default)"}`);
   let state;
   try {
+    // Seed the fresh room with the requested app (idempotent; no-op if unknown).
+    await apiPost("/api/create", TEMPLATE ? { template: TEMPLATE } : {});
     state = await apiGet("/api/state");
   } catch (e) {
     console.error(`\nCannot reach ${BASE} — is \`npm run dev\` running?\n${e.message}`);
@@ -194,7 +213,10 @@ async function main() {
   const suites = { counter: testCounter, tictactoe: testTictactoe, poker: testPoker };
   const suite = suites[app];
   if (!suite) {
-    console.error(`No smoke suite for templateId="${app}". Known: ${Object.keys(suites).join(", ")}.`);
+    console.error(
+      `No smoke suite for templateId="${app}". Pass an app to test: ` +
+        `npm run smoke -- <${Object.keys(suites).join(" | ")}>.`
+    );
     process.exit(2);
   }
 
