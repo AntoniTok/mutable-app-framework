@@ -17,6 +17,53 @@ the app — by hand or by asking an AI — and the next request runs the new cod
 
 ## Mental model
 
+**The shape of the system:** there is **one Worker** at the front. Every *room*
+behind it is a set of **Durable Objects** — **not** its own Worker. The single
+Worker routes each request to a room's DOs by id, and each app's code runs in an
+ephemeral **Dynamic Worker**:
+
+```
+                 ┌──────────┐   ┌──────────┐   ┌──────────┐
+   Browsers      │  lobby   │   │  room A  │   │  room B  │   (tabs)
+                 └────┬─────┘   └────┬─────┘   └────┬─────┘
+                      └──────── HTTP / WebSocket ───┘
+                                     │
+                        ╔════════════▼══════════════╗
+                        ║   ONE Worker  server.ts   ║  the only *deployed* Worker:
+                        ║   serves lobby + rooms,   ║  a stateless front door that
+                        ║   routes by ?room=<id>    ║  routes to each room's DOs
+                        ╚═══════╤═══════════╤═══════╝
+                 getAgentByName(A)         getAgentByName(B)
+                 ┌──────────────▼───┐   ┌───▼──────────────┐
+                 │ ROOM A = DOs     │   │ ROOM B = DOs     │  a "room" is a set of
+                 │  AppHost (Agent) │   │  AppHost (Agent) │  Durable Objects,
+                 │  CodeAssistant   │   │  CodeAssistant   │  NOT its own Worker
+                 │  AppData/Sql/... │   │  AppData/Sql/... │
+                 │        │         │   │        │         │
+                 │  env.LOADER.get  │   │  env.LOADER.get  │
+                 │        ▼         │   │        ▼         │
+                 │  Dynamic Worker  │   │  Dynamic Worker  │  runs the app's code
+                 │  (runs A's app)  │   │  (runs B's app)  │  (ephemeral, untrusted)
+                 └──────────────────┘   └──────────────────┘
+                    isolated from B         isolated from A
+```
+
+- **One Worker** (`server.ts`) — the only *deployed* Worker. Stateless front
+  door: serves the lobby and every room page, and routes each request to the
+  right room's DOs by `?room=`. (It scales to many edge instances, but it's one
+  codebase/deployment — there is no per-room Worker.)
+- **A "room" = Durable Objects** — each room is a small cluster of DOs
+  (`AppHost`, `CodeAssistant`, `AppData`, `AppSql`, `AppScheduler`) holding that
+  room's code, data and realtime state. Two rooms are fully isolated.
+- **Agent / Think** — not separate infrastructure, just DO base classes:
+  `AppHost extends Agent`, `CodeAssistant extends Think` (both are Durable
+  Objects with extra conveniences like state sync, WS routing, scheduling).
+- **Dynamic Worker** — an ephemeral isolate the Worker Loader creates *at
+  runtime* to execute an app's code-as-data (`env = { SYSTEM }` only). Not
+  deployed; created per room's current code version.
+
+The same system split by **responsibility** is three layers, two swappable:
+
 ```
                     ┌──────────────── STABLE CORE (the framework) ───────────────┐
 Browser ─── HTTP ──▶│  server.ts → AppHost (Durable Object, one per room)        │
@@ -30,8 +77,6 @@ Browser ─── HTTP ──▶│  server.ts → AppHost (Durable Object, one 
                      AI assistant (Think DO)            app templates (swappable,
                      agentic + memory                   include their own UI)
 ```
-
-Three layers, two of them swappable:
 
 1. **Stable core** — stores code, runs code, mutates code, sandboxes code. Never
    changes when you swap apps or models.

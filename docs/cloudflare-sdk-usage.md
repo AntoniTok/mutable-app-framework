@@ -301,14 +301,6 @@ genuinely subordinate to one parent and only that parent needs it; the moment a
 different caller needs it directly, use a named top-level DO so the parent never
 becomes a funnel.**
 
-#### Current platform status (checked 2026 — facets are no longer the public pattern)
-
-Since we made this migration, Cloudflare has effectively converged on our
-conclusion. As of the current docs:
-
-- **`ctx.facets` is gone from the public [DurableObjectState API](https://developers.cloudflare.com/durable-objects/api/state/)**, and "facet" appears **zero** times in the Durable Objects docs index (`llms.txt`). Facets still exist in the runtime (the Agents SDK uses them internally — `cf_agents_is_facet`), but they are no longer a recommended, documented public API.
-- The replacement is **`ctx.exports`** (behind the `enable_ctx_exports` compat flag): *"for each top-level export that extends DurableObject … `ctx.exports` automatically contains a Durable Object namespace binding."* In other words the platform's answer to "give a DO a second isolated SQLite" is now exactly what we did — **a named top-level DO** — with the added convenience that it can be reached via an auto-generated loopback namespace binding, no explicit `wrangler` binding required. This is essentially "facets, but addressable by name," the very thing recommendation #4 below asked for.
-
 **Possible future simplification (not yet adopted):** enable `enable_ctx_exports`
 and reach `AppData`/`AppSql`/`AppScheduler` via `ctx.exports` loopback bindings
 instead of the explicit `APP_DATA`/`APP_SQL`/`APP_SCHEDULER` bindings — fewer
@@ -379,6 +371,14 @@ is precisely why we bypass Think's helper and control the tool list ourselves.
 **For us:**
 1. **Add custom resource limits** (`limits.cpuMs` / `subRequests`) to the dynamic
    run to bound runaway generated code, complementing `globalOutbound: null`.
+   ✅ *Done — and extended well past the original idea.* Per-run `cpuMs`/`subRequests`
+   are applied in `runner.ts` (`loadWorker`), and `src/config/limits.ts` is now the
+   single source of a whole guardrail suite: mediated-fetch caps, store byte quotas
+   (`storeMaxValueBytes` / `storeMaxTotalBytes`), a daily email cap (`emailPerDay`),
+   a pending-tasks cap (`maxScheduledTasks`), and SQL caps (`sqlMaxRows` /
+   `sqlMaxDbBytes`). All ship generous by default, are clamped by `BOUNDS`, and are
+   per-app configurable via AppHost's trusted `__limits__` scope
+   (`GET` / `POST /api/limits`). Still open (limitation #5): request-rate throttling.
 2. **Consider AI Gateway** in front of the model calls for caching,
    rate-limiting, and cost/latency observability on the agentic loop.
 3. **Bundle weight is dominated by Think.** dofs now bundles into the worker
@@ -403,7 +403,7 @@ is precisely why we bypass Think's helper and control the tool list ourselves.
 3. **Support a "bring-your-own-filesystem" hook in Think.** Its biggest friction:
    it assumes the agent owns its filesystem. Users whose source of truth is
    external/gated (another DO, VCS, a build step) must disable the built-in tools.
-4. **Make facets addressable by name (or document the funnel).** ✅ *Largely
+4. **Make facets addressable by name (or document the funnel).** *Largely
    addressed by the platform since.* Facets were the natural way to give a DO a
    second isolated SQLite, but because a facet is only reachable *through its
    parent*, using one for data that many callers need turns the parent into a
