@@ -334,6 +334,19 @@ export class RoomCoordinator {
 
   // ── broadcast (with optional per-player projection) ──
 
+  /**
+   * Public presence snapshot for the app-driven Room capability
+   * (`requestRoom().presence()`): the app-declared seat pool, which seats have a
+   * connected holder, and the total connected (non-spectator) client count.
+   */
+  presence(): { seats: Seat[]; players: Record<Seat, boolean>; count: number } {
+    return {
+      seats: this.#seatNames(),
+      players: this.#players(),
+      count: [...this.#host.roomConnections()].length
+    };
+  }
+
   /** Live presence per seat: seat -> is a connected player holding it. */
   #players(): Record<Seat, boolean> {
     const seats = this.#readSeats();

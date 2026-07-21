@@ -37,3 +37,27 @@ export const DEFAULT_TEMPLATE_ID = "blackjack";
 export function getTemplate(id: string | undefined): AppTemplate {
   return templates[id ?? DEFAULT_TEMPLATE_ID] ?? templates[DEFAULT_TEMPLATE_ID];
 }
+
+/** True if `id` names a template that actually ships in the catalog. */
+export function isKnownTemplate(id: string | undefined): id is string {
+  return typeof id === "string" && id in templates;
+}
+
+/**
+ * The template catalog for the lobby's "Create room" picker — id + label +
+ * declared capabilities only (never the file bodies). `default` flags the id a
+ * room seeds from when none is chosen.
+ */
+export function listTemplates(): {
+  id: string;
+  label: string;
+  declares: string[];
+  default: boolean;
+}[] {
+  return Object.values(templates).map((t) => ({
+    id: t.id,
+    label: t.label,
+    declares: t.declares ?? [],
+    default: t.id === DEFAULT_TEMPLATE_ID
+  }));
+}

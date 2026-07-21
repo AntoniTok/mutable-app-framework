@@ -25,17 +25,29 @@
   //                   AppHost — so storage traffic never funnels through the code
   //                   DO (limitation #3). It needs `nodejs_compat` (dofs uses
   //                   node:crypto/node:events), which the worker already enables.
+  //  - AppScheduler : the app's per-room task scheduler (broker.requestScheduler),
+  //                   in its OWN SQLite + a DO alarm. Runs the app's onSchedule
+  //                   export when a task comes due; reached DIRECTLY by the
+  //                   ScopedScheduler stub (limitation #3).
+  //  - AppSql       : the app's per-room RELATIONAL database (broker.requestSql),
+  //                   its OWN SQLite. A real SQL surface (arbitrary schema +
+  //                   queries) distinct from AppData's flat KV; reached DIRECTLY
+  //                   by the ScopedSql stub (limitation #3).
   "durable_objects": {
     "bindings": [
       { "name": "AppHost", "class_name": "AppHost" },
       { "name": "CodeAssistant", "class_name": "CodeAssistant" },
-      { "name": "APP_DATA", "class_name": "AppData" }
+      { "name": "APP_DATA", "class_name": "AppData" },
+      { "name": "APP_SCHEDULER", "class_name": "AppScheduler" },
+      { "name": "APP_SQL", "class_name": "AppSql" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["AppHost"] },
     { "tag": "v2", "new_sqlite_classes": ["CodeAssistant"] },
-    { "tag": "v3", "new_sqlite_classes": ["AppData"] }
+    { "tag": "v3", "new_sqlite_classes": ["AppData"] },
+    { "tag": "v4", "new_sqlite_classes": ["AppScheduler"] },
+    { "tag": "v5", "new_sqlite_classes": ["AppSql"] }
   ],
 
   // Workers AI: used by the host-side AI author to rewrite app code.
@@ -45,6 +57,13 @@
   // binary objects — images, audio, exports — that exceed the 256 KiB fs cap.
   // Local `wrangler dev` simulates this without creating a real bucket.
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "mutable-app-blobs" }],
+
+  // Cloudflare Email Service: backs the app email capability (broker.requestEmail)
+  // via the mediated ScopedEmail stub. The sending domain must be onboarded
+  // (`wrangler email sending enable <domain>`); local `wrangler dev` can't send
+  // without `"remote": true` + a verified domain, so sends fail with a clear
+  // service error in dev — the policy/quota mediation still runs.
+  "send_email": [{ "name": "EMAIL" }],
 
   // Model for the Think-based coding assistant. Must be a reliable tool-caller;
   // kimi-k2.7-code is a frontier-scale (1T-param) agentic coding model with a

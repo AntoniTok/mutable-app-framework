@@ -16,12 +16,26 @@
  *     a `.ts` file; that is NOT a constraint on apps saved at runtime.) The only
  *     hard limit is no npm/external imports.
  *   - Persist data ONLY through the capability broker handed in as `env.SYSTEM`.
- *     Two storage capabilities exist today:
+ *     Several storage capabilities exist today:
  *
  *       // Flat key/value store — strings in, strings out.
  *       const store = await env.SYSTEM.requestStore("main");
  *       await store.put("count", "1");
  *       const n = await store.get("count");   // string | null
+ *
+ *       // SQL — a private RELATIONAL database (its own SQLite). Reach for this
+ *       // over the flat store whenever data is tabular, related, filtered,
+ *       // sorted, or aggregated (leaderboards, todo lists, chat logs).
+ *       const db = await env.SYSTEM.requestSql();
+ *       await db.exec(
+ *         "CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, text TEXT, done INTEGER DEFAULT 0)"
+ *       );
+ *       await db.run("INSERT INTO todos (text) VALUES (?)", text); // {rowsWritten,lastRowId}
+ *       const open = await db.query("SELECT * FROM todos WHERE done = ?", 0); // rows[]
+ *       const one = await db.first("SELECT * FROM todos WHERE id = ?", id);   // row | null
+ *       // ALWAYS use ? placeholders + params (never concatenate user input).
+ *       // Booleans store as 0/1. Queries are row-capped (paginate with LIMIT);
+ *       // the DB has a size cap. Both are per-app configurable limits.
  *
  *       // ATOMIC ops — safe under concurrent requests (a get()+put() pair is
  *       // NOT: the input gate releases between them, so parallel requests lose
@@ -57,6 +71,20 @@
  *       await blobs.delete("pic.png");
  *       const keys = await blobs.list();          // string[]
  *
+ *     Secrets (API keys / credentials) follow a USE-NOT-READ model. The USER sets
+ *     them in the room's secret settings; the app can never read a value unless it
+ *     is flagged `readable`. To call an authenticated API, INJECT a secret into a
+ *     header (via requestFetch) without ever reading it:
+ *
+ *       const net = await env.SYSTEM.requestFetch();
+ *       await net.send("https://api.example.com/x", {
+ *         secretHeaders: { Authorization: { secret: "MY_KEY", prefix: "Bearer " } }
+ *       });
+ *       // check availability (names only):
+ *       const sec = await env.SYSTEM.requestSecrets();
+ *       await sec.has("MY_KEY");  await sec.list();
+ *       await sec.get("MY_KEY");  // raw value — ONLY if flagged readable, else throws
+ *
  *   - There is NO direct network access (egress is blocked). Reach the outside
  *     world only through capabilities the broker grants — including a MEDIATED
  *     fetch, which only reaches hosts on this app's allowlist (managed outside
@@ -66,6 +94,51 @@
  *       const res = await net.send("https://api.example.com/x");
  *       // res = { status, statusText, headers: [k,v][], body: ArrayBuffer }
  *       const text = new TextDecoder().decode(res.body);
+ *
+ *     Email (TRANSACTIONAL only — confirmations, alerts; not bulk/marketing) is
+ *     sent through a MEDIATED capability. The USER configures allowed
+ *     senders/recipients + a daily cap in the room's email settings; the app can
+ *     NEVER pick an arbitrary From (omit `from` for the default) or exceed the cap.
+ *     Always include a plain-text `text` alongside `html`:
+ *
+ *       const mail = await env.SYSTEM.requestEmail();
+ *       await mail.send({
+ *         to: "user@example.com",           // string | string[]; cc/bcc allowed
+ *         subject: "Welcome",
+ *         text: "Thanks for signing up.",
+ *         html: "<p>Thanks for signing up.</p>",
+ *         from: "noreply@example.com"       // optional; must be an allowed sender
+ *       });
+ *       // -> { ok: true, from, recipients }   (throws on policy/cap violation)
+ *
+ *     App-driven realtime (PUSH to connected clients from your OWN code — an HTTP
+ *     handler, a webhook, a scheduled task — rather than only reacting to a
+ *     WebSocket action). This is the ESCAPE HATCH; the DEFAULT for multiplayer is
+ *     the pure `applyAction` reducer below. Messages arrive as {type:"app",data}
+ *     frames; keep app-driven state in `requestStore`:
+ *
+ *       const room = await env.SYSTEM.requestRoom();
+ *       await room.broadcast({ kind: "toast", text: "Go!" });  // all clients
+ *       await room.send("A", { hand: [...] });   // only the client in seat "A"
+ *       const p = await room.presence();          // { seats, players, count }
+ *
+ *     Scheduler (run code LATER — reminders, timeouts, polling, timed realtime
+ *     updates). Schedule a task, then handle it in an `onSchedule(env, ctx)`
+ *     export (ctx = { task, payload }), which runs in the normal sandbox with
+ *     `env.SYSTEM` — so a task can persist, fetch, email, or broadcast:
+ *
+ *       const s = await env.SYSTEM.requestScheduler();
+ *       const { id } = await s.after(60, "remind", { userId });  // in 60s
+ *       await s.every(300, "poll");        // recurring, every 5 min (min 1s)
+ *       await s.at(Date.now() + 3600e3, "expire");   // absolute epoch-ms
+ *       await s.cancel(id);  await s.list();
+ *
+ *       export async function onSchedule(env, ctx) {
+ *         if (ctx.task === "remind") {
+ *           const room = await env.SYSTEM.requestRoom();
+ *           await room.broadcast({ kind: "reminder", ...ctx.payload });
+ *         }
+ *       }
  *
  * ── REALTIME CONTRACT (optional — for multiplayer apps) ──
  *   An app becomes multiplayer by adding two PURE named exports. It still holds
@@ -157,6 +230,8 @@
  *   each broadcast `{type:"state"}`. Absent `applyAction` = a non-realtime app.
  */
 
+import type { CapabilityId } from "../capabilities/manifest";
+
 export interface AppFile {
   path: string;
   content: string;
@@ -170,11 +245,15 @@ export interface AppTemplate {
   /** The files this template seeds a new app with. */
   files: AppFile[];
   /**
-   * Capabilities this app expects the broker to grant.
-   * Today "store" (key/value), "fs" (filesystem), "blob" (R2) and "fetch"
-   * (mediated egress) exist. Future: "room".
+   * Capabilities this app expects the broker to grant. The vocabulary is the
+   * SINGLE source of truth in `src/capabilities/manifest.ts` (`CapabilityId`):
+   * "store" (key/value), "sql" (relational database via `requestSql`), "fs"
+   * (filesystem), "blob" (R2), "fetch" (mediated egress), "secrets", "email",
+   * "room" (app-driven realtime via `requestRoom`), and "scheduler"
+   * (deferred/recurring work via `requestScheduler` + the `onSchedule` export)
+   * are all live today. Adding a capability = add it there.
    */
-  declares: string[];
+  declares: CapabilityId[];
   /**
    * Hosts this app is allowed to reach via `env.SYSTEM.requestFetch()`. Seeds
    * the per-app egress allowlist on first boot (editable later via /api/egress).

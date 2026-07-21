@@ -6,6 +6,7 @@ import {
   WorkspaceFilesystem,
   type WorkspaceFsError
 } from "@cloudflare/dofs";
+import { DEFAULT_LIMITS } from "../config/limits";
 import type {
   AppDataStore,
   AppFsStore,
@@ -58,6 +59,19 @@ import type {
  */
 const MAX_FS_FILE_BYTES = 256 * 1024;
 
+/**
+ * Reserved store scope for AppData's own metadata (the pushed storage caps).
+ * Safe from collision: app-chosen namespaces are validated by the broker's
+ * NAME_RE, which requires the first char to be `[a-z0-9]`, so a leading `_`
+ * scope can never be an app namespace.
+ */
+const META_SCOPE = "__meta__";
+const LIMITS_META_KEY = "storeLimits";
+
+function utf8Bytes(s: string): number {
+  return new TextEncoder().encode(s).byteLength;
+}
+
 /** True when a dofs error means "no such file/dir". */
 function isEnoent(err: unknown): boolean {
   return (
@@ -80,12 +94,94 @@ function direntType(node: {
 export class AppData extends DurableObject<Env> implements AppDataStore, AppFsStore {
   #fs?: WorkspaceFilesystem;
 
+  // Storage guardrails (limitation #5). Generous defaults; the resolved values
+  // are pushed from AppHost.setLimits (trusted policy) and persisted in the
+  // reserved __meta__ scope so they survive DO restarts.
+  #maxValueBytes = DEFAULT_LIMITS.storeMaxValueBytes;
+  #maxTotalBytes = DEFAULT_LIMITS.storeMaxTotalBytes;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     // Idempotent: this DO's OWN SQLite (isolated from AppHost's code store).
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS app_data (scope TEXT NOT NULL, k TEXT NOT NULL, v TEXT NOT NULL, PRIMARY KEY (scope, k))"
     );
+    // Load any previously-pushed storage caps.
+    const rows = ctx.storage.sql
+      .exec<{ v: string }>(
+        "SELECT v FROM app_data WHERE scope = ? AND k = ?",
+        META_SCOPE,
+        LIMITS_META_KEY
+      )
+      .toArray();
+    if (rows.length) {
+      try {
+        const parsed = JSON.parse(rows[0].v) as {
+          maxValueBytes?: number;
+          maxTotalBytes?: number;
+        };
+        if (typeof parsed.maxValueBytes === "number") this.#maxValueBytes = parsed.maxValueBytes;
+        if (typeof parsed.maxTotalBytes === "number") this.#maxTotalBytes = parsed.maxTotalBytes;
+      } catch {
+        // keep defaults
+      }
+    }
+  }
+
+  /**
+   * Push the resolved storage caps down from AppHost (the trusted policy owner).
+   * Persisted so they outlive a DO restart. Enforced locally on every write so
+   * the store hot path never has to funnel back through AppHost (limitation #3).
+   */
+  async setStorageLimits(limits: { maxValueBytes: number; maxTotalBytes: number }): Promise<void> {
+    if (typeof limits.maxValueBytes === "number") this.#maxValueBytes = limits.maxValueBytes;
+    if (typeof limits.maxTotalBytes === "number") this.#maxTotalBytes = limits.maxTotalBytes;
+    this.ctx.storage.sql.exec(
+      "INSERT INTO app_data (scope, k, v) VALUES (?, ?, ?) ON CONFLICT (scope, k) DO UPDATE SET v = excluded.v",
+      META_SCOPE,
+      LIMITS_META_KEY,
+      JSON.stringify({ maxValueBytes: this.#maxValueBytes, maxTotalBytes: this.#maxTotalBytes })
+    );
+  }
+
+  /** Throw if a single value exceeds the per-value cap. */
+  #enforceValueSize(value: string): void {
+    const bytes = utf8Bytes(value);
+    if (bytes > this.#maxValueBytes) {
+      throw new Error(
+        `Value too large (${bytes} bytes, max ${this.#maxValueBytes}). ` +
+          "Raise the limit in the room's resource settings, or use the blob store for large data."
+      );
+    }
+  }
+
+  /**
+   * Throw if writing `newValue` at (scope,key) would push the app's total store
+   * bytes past the cap. A soft cap: excludes the reserved __meta__ row and the
+   * filesystem's vfs_* tables (large binaries belong in the blob store).
+   */
+  #enforceTotalSize(scope: string, key: string, newValue: string): void {
+    const [oldRow] = this.ctx.storage.sql
+      .exec<{ len: number }>(
+        "SELECT LENGTH(v) AS len FROM app_data WHERE scope = ? AND k = ?",
+        scope,
+        key
+      )
+      .toArray();
+    const oldLen = oldRow ? oldRow.len : 0;
+    const [sumRow] = this.ctx.storage.sql
+      .exec<{ total: number }>(
+        "SELECT COALESCE(SUM(LENGTH(v)), 0) AS total FROM app_data WHERE scope != ?",
+        META_SCOPE
+      )
+      .toArray();
+    const projected = (sumRow?.total ?? 0) - oldLen + newValue.length;
+    if (projected > this.#maxTotalBytes) {
+      throw new Error(
+        `Store quota exceeded (~${projected} bytes, max ${this.#maxTotalBytes}). ` +
+          "Delete unused keys or raise the limit in the room's resource settings."
+      );
+    }
   }
 
   // ── key/value store (invoked by ScopedStore over RPC) ──
@@ -102,6 +198,8 @@ export class AppData extends DurableObject<Env> implements AppDataStore, AppFsSt
   }
 
   async storePut(scope: string, key: string, value: string): Promise<void> {
+    this.#enforceValueSize(value);
+    this.#enforceTotalSize(scope, key, value);
     this.ctx.storage.sql.exec(
       "INSERT INTO app_data (scope, k, v) VALUES (?, ?, ?) ON CONFLICT (scope, k) DO UPDATE SET v = excluded.v",
       scope,
@@ -176,6 +274,8 @@ export class AppData extends DurableObject<Env> implements AppDataStore, AppFsSt
       .toArray();
     const current = rows.length ? rows[0].v : null;
     if (current !== expected) return false;
+    this.#enforceValueSize(next);
+    this.#enforceTotalSize(scope, key, next);
     this.ctx.storage.sql.exec(
       "INSERT INTO app_data (scope, k, v) VALUES (?, ?, ?) ON CONFLICT (scope, k) DO UPDATE SET v = excluded.v",
       scope,

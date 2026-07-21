@@ -8,8 +8,9 @@ import type { AppTemplate } from "../types";
  * filesystem capability (`env.SYSTEM.requestFilesystem`) — folders, listing,
  * reading/writing/removing files. It exists to show the fs contract; it is NOT
  * part of the framework core. Delete it, edit it, or add your own alongside it
- * and register it in ../registry.ts. To host it, set
- * DEFAULT_TEMPLATE_ID = "notes" in ../registry.ts.
+ * and register it in ../registry.ts. Once registered it appears in the lobby's
+ * app picker; create a room with it (or set DEFAULT_TEMPLATE_ID = "notes" in
+ * ../registry.ts to make it the fallback).
  *
  * Each note is one file under "notes/<name>.txt". The app never sees a raw
  * filesystem — the broker hands it a namespace-scoped capability, and paths are

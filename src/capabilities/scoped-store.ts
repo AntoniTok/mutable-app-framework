@@ -31,11 +31,9 @@ export class ScopedStore extends WorkerEntrypoint<Env, ScopedStoreProps> {
   }
 
   async put(key: string, value: string): Promise<void> {
-    // Basic guardrails live here in the trusted host, not in the app.
+    // Coerce here; the per-value / per-app byte caps are enforced in AppData
+    // (configurable per app via the room's resource limits — see config/limits).
     if (typeof value !== "string") value = String(value);
-    if (value.length > 1_000_000) {
-      throw new Error("Value too large (max 1MB).");
-    }
     await this.#store().storePut(this.ctx.props.namespace, key, value);
   }
 

@@ -19,6 +19,7 @@ import type { Env } from "../types";
 import type { AppHost } from "../agent/app-host";
 import type { AppFile } from "../templates/types";
 import { getTemplate } from "../templates/registry";
+import { renderCapabilityContract } from "../capabilities/manifest";
 import { applyEdits, type FileEdit } from "../author/workers-ai-author";
 
 /**
@@ -169,9 +170,9 @@ THE APP CONTRACT (code you write MUST follow this):
 - Default export with an async fetch handler: export default { async fetch(request, env) { ... } }.
 - GET "/" returns a complete interactive HTML document (content-type "text/html"); actions live behind data endpoints returning JSON.
 - Use RELATIVE URLs in the page (fetch("inc"), NOT "/inc") — the app is previewed under a subpath.
-- Persist ONLY via env.SYSTEM. Key/value: const s = await env.SYSTEM.requestStore("ns"); s.put/get/list/delete (string values). For counters or any read-modify-write, use the ATOMIC ops s.incr(key, delta) (returns the new number) and s.cas(key, expected, next) — a get()+put() pair races under concurrent requests and loses updates, so never hand-roll a counter that way. Filesystem (small structured data, <=256KiB): const fs = await env.SYSTEM.requestFilesystem("ns"); fs.readFile/writeFile/readdir/mkdir/rm/stat/grep/find (relative paths).
-- Large binary objects (images, audio, exports too big for the 256KiB fs cap): const blobs = await env.SYSTEM.requestBlobStore("ns"); blobs.put(key, bytesOrString)/get(key)->ArrayBuffer|null/delete(key)/list()->string[].
-- NO direct network access. The ONLY way out is mediated fetch, and ONLY to hosts on this app's allowlist (managed by the user via the room's egress settings, NOT by you or the app): const net = await env.SYSTEM.requestFetch(); const res = await net.send(url, { method, headers, body }); res = { status, statusText, headers, body(ArrayBuffer) }. A host that isn't allowlisted throws — if the user wants a new API, tell them to add its host in egress settings. Your code is BUNDLED (esbuild) before it runs, so modern JS is fine — template literals (backticks) and \${...} interpolation are fully supported; the only limit is no npm/external package imports (write plain JS/TS across your own files).
+- Persist and reach the outside world ONLY via env.SYSTEM capabilities (below). Pick the ONE that fits the data; don't mirror the same data into two.
+${renderCapabilityContract()}
+- Your code is BUNDLED (esbuild) before it runs, so modern JS is fine — template literals (backticks) and \${...} interpolation are fully supported; the only limit is no npm/external package imports (write plain JS/TS across your own files).
 - Realtime/multiplayer apps additionally export PURE functions: applyAction(state, action, ctx), optional initialState, seats, view(state, ctx). They hold no sockets.
 - Editing code does NOT auto-wipe an in-progress game: the framework keeps the stored state across your edit when it stays compatible with the new code (it probes the old state against the new view/initialState). So DON'T worry that a cosmetic/logic tweak resets the game — it won't. Only if you make a BREAKING change to the state SHAPE should you add a pure migrate(oldState, oldStateVersion) export that reshapes old state for the new code (return undefined to decline and let it reset). Keep any existing migrate/stateVersion exports when editing.
 - migrate (above) ONLY reshapes the realtime shared state. Your app's OWN persisted data (anything written via requestStore/requestFilesystem/requestBlobStore) is separate and is NOT auto-migrated. If a change alters THAT data's shape (e.g. renaming a store key, restructuring a JSON value), export async function onUpgrade(env, ctx) — env is the SAME as fetch's env, so you READ and REWRITE your own data there (it is NOT pure). The framework runs it ONCE per forward promote, right after your version goes live; ctx = { fromVersion, toVersion }. Make it IDEMPOTENT and guard on the current shape (e.g. if (cfg.schema === 1)), since it runs on every forward promote. Keep any existing onUpgrade when editing.

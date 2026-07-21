@@ -2,17 +2,25 @@ import { getAgentByName, routeAgentRequest } from "agents";
 import type { Env } from "./types";
 import type { AppHost } from "./agent/app-host";
 import { runApp } from "./agent/runner";
+import { isKnownTemplate, listTemplates } from "./templates/registry";
 
 // The Agent + capability entrypoints must be exported from the main module so
 // the runtime can instantiate them (DO) and mint stubs (WorkerEntrypoint).
 export { AppHost } from "./agent/app-host";
 export { AppData } from "./agent/app-data";
+export { AppScheduler } from "./agent/app-scheduler";
+export { AppSql } from "./agent/app-sql";
 export { CodeAssistant } from "./assistant/code-assistant";
 export { CapabilityBroker } from "./capabilities/broker";
 export { ScopedStore } from "./capabilities/scoped-store";
 export { ScopedFilesystem } from "./capabilities/scoped-filesystem";
 export { ScopedBlobStore } from "./capabilities/scoped-blob-store";
 export { ScopedFetcher } from "./capabilities/scoped-fetcher";
+export { ScopedSecrets } from "./capabilities/scoped-secrets";
+export { ScopedEmail } from "./capabilities/scoped-email";
+export { ScopedRoom } from "./capabilities/scoped-room";
+export { ScopedScheduler } from "./capabilities/scoped-scheduler";
+export { ScopedSql } from "./capabilities/scoped-sql";
 // Tail Worker: captures logs/exceptions/outcome from the untrusted app's
 // Dynamic Worker runs into Workers Logs (attached in src/agent/runner.ts).
 export { DynamicWorkerTail } from "./observability/dynamic-worker-tail";
@@ -48,12 +56,31 @@ async function handleApi(
   env: Env,
   path: string
 ): Promise<Response> {
+  // Static catalog for the lobby's template picker — no room / DO involved.
+  if (path === "/api/templates" && request.method === "GET") {
+    return json({ templates: listTemplates() });
+  }
+
   const room = roomOf(new URL(request.url));
   const agent = await getAgentByName<Env, AppHost>(env.AppHost, room);
 
   try {
+    // Create/seed a room from a chosen template (runtime template selection).
+    // Idempotent: an existing room is returned unchanged (never re-seeded).
+    if (path === "/api/create" && request.method === "POST") {
+      const body = (await request.json().catch(() => ({}))) as { template?: unknown };
+      const template =
+        typeof body.template === "string" && isKnownTemplate(body.template)
+          ? body.template
+          : undefined;
+      const { state, created } = await agent.create(template);
+      return json({ room, templateId: state.templateId, created });
+    }
     if (path === "/api/state" && request.method === "GET") {
       return json(await agent.getStatus());
+    }
+    if (path === "/api/resources" && request.method === "GET") {
+      return json(await agent.getResources());
     }
     if (path === "/api/files" && request.method === "GET") {
       return json({ files: await agent.getFiles() });
@@ -87,6 +114,50 @@ async function handleApi(
         return errorResponse("allow[] (string hostnames) required", 400);
       const allow = await agent.setEgressAllowlist(body.allow as string[]);
       return json({ allow });
+    }
+    if (path === "/api/limits" && request.method === "GET") {
+      return json({ limits: await agent.getLimits() });
+    }
+    if (path === "/api/limits" && request.method === "POST") {
+      const body = (await request.json()) as { limits?: unknown };
+      if (typeof body.limits !== "object" || body.limits === null)
+        return errorResponse("limits (object) required", 400);
+      const limits = await agent.setLimits(body.limits as Record<string, number>);
+      return json({ limits });
+    }
+    if (path === "/api/secrets" && request.method === "GET") {
+      // Names + readable flags ONLY — values are never returned over the wire.
+      return json({ secrets: await agent.listSecrets() });
+    }
+    if (path === "/api/secrets" && request.method === "POST") {
+      const body = (await request.json()) as {
+        name?: unknown;
+        value?: unknown;
+        readable?: unknown;
+        delete?: unknown;
+      };
+      if (typeof body.name !== "string" || body.name.length === 0)
+        return errorResponse("name (string) required", 400);
+      if (body.delete === true || body.value === null || body.value === undefined) {
+        await agent.deleteSecret(body.name);
+        return json({ ok: true, deleted: body.name });
+      }
+      const info = await agent.setSecret(
+        body.name,
+        String(body.value),
+        body.readable === true
+      );
+      return json({ secret: info });
+    }
+    if (path === "/api/email" && request.method === "GET") {
+      return json({ policy: await agent.getEmailPolicy() });
+    }
+    if (path === "/api/email" && request.method === "POST") {
+      const body = (await request.json()) as { policy?: unknown };
+      if (typeof body.policy !== "object" || body.policy === null)
+        return errorResponse("policy (object) required", 400);
+      const policy = await agent.setEmailPolicy(body.policy as Record<string, unknown>);
+      return json({ policy });
     }
     return errorResponse("Not found", 404);
   } catch (err) {
@@ -135,7 +206,9 @@ async function handlePreview(request: Request, env: Env): Promise<Response> {
       entrypoint: manifest.entrypoint,
       request: appRequest,
       // Cold-cache only: reuse the build persisted on promote (limitation #4).
-      resolvePrebuilt: (hash) => agent.getBuild(hash)
+      resolvePrebuilt: (hash) => agent.getBuild(hash),
+      // Per-run guardrails (limitation #5): generous, per-app configurable.
+      limits: manifest.limits
     });
 
     const contentType = response.headers.get("content-type") ?? "";

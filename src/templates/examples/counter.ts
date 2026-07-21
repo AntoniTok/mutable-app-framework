@@ -5,8 +5,9 @@ import type { AppTemplate } from "../types";
  *
  * This ships as an example to demonstrate the app contract. It is NOT part of
  * the framework core — delete it, edit it, or add your own alongside it in this
- * `examples/` folder and register it in ../registry.ts. To make it the hosted
- * app, set DEFAULT_TEMPLATE_ID = "counter" in ../registry.ts.
+ * `examples/` folder and register it in ../registry.ts. Once registered it shows
+ * up in the lobby's app picker; create a room with it (or set it as
+ * DEFAULT_TEMPLATE_ID in ../registry.ts to make it the fallback).
  *
  * This is a real, rendered web app — not a text API:
  *   - GET "/"      returns a full HTML page with a number display and buttons

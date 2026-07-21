@@ -3,6 +3,7 @@
 // Runtime types generated with workerd@1.20260708.1 2026-07-14 nodejs_compat
 interface __BaseEnv_Env {
 	BLOBS: R2Bucket;
+	EMAIL: SendEmail;
 	LOADER: WorkerLoader;
 	AI: Ai;
 	ASSISTANT_MODEL: string;

@@ -157,6 +157,21 @@ function hostEntrySource(appEntry: string): string {
     "      return { ok: false, ran: true, error: (e && e.message) ? e.message : String(e) };",
     "    }",
     "  }",
+    "  // Optional SCHEDULED-task handler (broker.requestScheduler). Runs when a",
+    "  // task the app scheduled comes due — fired by the AppScheduler DO's alarm.",
+    "  // Like onUpgrade it may do I/O: it gets the SAME env as fetch ({ SYSTEM }),",
+    "  // so it can read/write app data, call requestFetch, or push to clients via",
+    "  // requestRoom. `ran:false` means the app exports no onSchedule (a no-op).",
+    "  async onSchedule(task, payload) {",
+    "    const fn = pick('onSchedule');",
+    "    if (typeof fn !== 'function') return { ok: true, ran: false };",
+    "    try {",
+    "      await fn(this.env, { task, payload });",
+    "      return { ok: true, ran: true };",
+    "    } catch (e) {",
+    "      return { ok: false, ran: true, error: (e && e.message) ? e.message : String(e) };",
+    "    }",
+    "  }",
     "}",
     ""
   ].join("\n");
@@ -239,6 +254,15 @@ export interface UpgradeResult {
   error?: string;
 }
 
+/** RPC-serializable result of running the app's optional `onSchedule` (see #2.4). */
+export interface ScheduleResult {
+  /** False only when the app's onSchedule threw (`error` explains). */
+  ok: boolean;
+  /** True when the app actually exports an onSchedule (false = nothing to run). */
+  ran?: boolean;
+  error?: string;
+}
+
 /**
  * A bundled app, ready to hand straight to the Worker Loader. Produced once by
  * `bundleApp` (on promote) and persisted, so the request path never has to
@@ -282,6 +306,12 @@ export async function bundleApp(
   };
 }
 
+/** Per-run resource limits handed to the Worker Loader (limitation #5). */
+export interface RunLimits {
+  cpuMs: number;
+  subRequests: number;
+}
+
 /** Shared worker-code factory used by every run path (one cache entry per hash). */
 function loadWorker(opts: {
   env: Env;
@@ -292,8 +322,10 @@ function loadWorker(opts: {
   collected: { warnings: string[] };
   /** Resolve a persisted build for this hash (consulted ONLY on a cold cache). */
   resolvePrebuilt?: ResolvePrebuilt;
+  /** Per-run cpu/subrequest guardrails (generous defaults; per-app configurable). */
+  limits?: RunLimits;
 }) {
-  const { env, instance, files, entrypoint, hash, collected, resolvePrebuilt } = opts;
+  const { env, instance, files, entrypoint, hash, collected, resolvePrebuilt, limits } = opts;
   const workerId = `app-${instance}-${hash}`;
   const worker = env.LOADER.get(workerId, async () => {
     // Cold cache only: use the persisted build if one exists (skips the
@@ -320,6 +352,10 @@ function loadWorker(opts: {
       modules,
       compatibilityDate: "2026-01-01",
       compatibilityFlags: ["nodejs_compat"],
+      // Per-run resource guardrails (limitation #5): bound a runaway app run's
+      // CPU time and outbound subrequests. Generous defaults set by the caller
+      // (see src/config/limits.ts); omitted => platform defaults apply.
+      ...(limits ? { limits: { cpuMs: limits.cpuMs, subRequests: limits.subRequests } } : {}),
       // The ONLY capability the untrusted app receives.
       env: {
         SYSTEM: runtimeExports.CapabilityBroker({ props: { instance } })
@@ -347,8 +383,9 @@ async function getWorker(opts: {
   files: AppFile[];
   entrypoint: string;
   resolvePrebuilt?: ResolvePrebuilt;
+  limits?: RunLimits;
 }): Promise<{ worker: ReturnType<typeof loadWorker>["worker"]; workerId: string; collected: { warnings: string[] } }> {
-  const { env, instance, files, entrypoint, resolvePrebuilt } = opts;
+  const { env, instance, files, entrypoint, resolvePrebuilt, limits } = opts;
   const hash = await fingerprint(files);
   const collected: { warnings: string[] } = { warnings: [] };
   const { worker, workerId } = loadWorker({
@@ -358,7 +395,8 @@ async function getWorker(opts: {
     entrypoint,
     hash,
     collected,
-    resolvePrebuilt
+    resolvePrebuilt,
+    limits
   });
   return { worker, workerId, collected };
 }
@@ -371,15 +409,17 @@ export async function runApp(opts: {
   entrypoint: string;
   request: Request;
   resolvePrebuilt?: ResolvePrebuilt;
+  limits?: RunLimits;
 }): Promise<RunResult> {
-  const { env, instance, version, files, entrypoint, request, resolvePrebuilt } = opts;
+  const { env, instance, version, files, entrypoint, request, resolvePrebuilt, limits } = opts;
 
   const { worker, workerId, collected } = await getWorker({
     env,
     instance,
     files,
     entrypoint,
-    resolvePrebuilt
+    resolvePrebuilt,
+    limits
   });
 
   const entry = worker.getEntrypoint() as Fetcher;
@@ -550,4 +590,30 @@ export async function runUpgrade(opts: {
     onUpgrade(fromVersion: number, toVersion: number): Promise<UpgradeResult>;
   };
   return await logic.onUpgrade(fromVersion, toVersion);
+}
+
+/**
+ * Run the app's optional `onSchedule(env, ctx)` export inside the sandbox when a
+ * scheduled task comes due (fired by the AppScheduler DO's alarm). Like
+ * `runUpgrade`, it runs with the app's capability broker (`env.SYSTEM`), so the
+ * task can touch app data, fetch, or broadcast via `requestRoom`. `ctx` is
+ * `{ task, payload }`. Returns `{ ok:true, ran:false }` when the app exports no
+ * `onSchedule` (the scheduled task is then a harmless no-op).
+ */
+export async function runSchedule(opts: {
+  env: Env;
+  instance: string;
+  files: AppFile[];
+  entrypoint: string;
+  task: string;
+  payload: unknown;
+  resolvePrebuilt?: ResolvePrebuilt;
+}): Promise<ScheduleResult> {
+  const { env, instance, files, entrypoint, task, payload, resolvePrebuilt } = opts;
+  const { worker } = await getWorker({ env, instance, files, entrypoint, resolvePrebuilt });
+
+  const logic = worker.getEntrypoint("Logic") as unknown as {
+    onSchedule(task: string, payload: unknown): Promise<ScheduleResult>;
+  };
+  return await logic.onSchedule(task, payload);
 }

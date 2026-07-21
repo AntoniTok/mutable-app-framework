@@ -2,8 +2,19 @@ import { Agent } from "agents";
 import type { Connection, ConnectionContext, WSMessage } from "agents";
 import type { Env } from "../types";
 import type { AppFile } from "../templates/types";
+import type { EmailPolicy, ResolvedSender, RoomPresence } from "../types";
 import { getTemplate, DEFAULT_TEMPLATE_ID } from "../templates/registry";
+import { CAPABILITIES } from "../capabilities/manifest";
+import type { CapabilityId } from "../capabilities/manifest";
 import { bundleApp, runApp, runUpgrade, fingerprint } from "./runner";
+import type { RunLimits } from "./runner";
+import {
+  type AppLimits,
+  LIMITS_KEY,
+  LIMITS_SCOPE,
+  mergeLimits,
+  parseLimits
+} from "../config/limits";
 import type { StoredBuild } from "./schema";
 import { RoomCoordinator } from "../realtime/coordinator";
 import type { ConnState, RoomHost } from "../realtime/coordinator";
@@ -46,6 +57,35 @@ export interface PreviewResult {
   body: ArrayBuffer;
 }
 
+/** A public, serializable slice of a capability spec for the Resources panel. */
+export interface CapabilitySummary {
+  id: CapabilityId;
+  label: string;
+  summary: string;
+  available: boolean;
+  configurable: boolean;
+  /** True if this app's template declares (expects to use) this capability. */
+  declared: boolean;
+}
+
+/**
+ * A single snapshot of everything the Resources panel renders: the capability
+ * catalog (from the manifest — the single source of truth) plus the current
+ * per-app configuration for each configurable capability. One RPC = one
+ * consistent read; the panel mutates via the existing `/api/{egress,limits,
+ * secrets,email}` routes and re-fetches.
+ */
+export interface AppResources {
+  templateId: string;
+  capabilities: CapabilitySummary[];
+  egress: string[];
+  limits: AppLimits;
+  secrets: { name: string; readable: boolean }[];
+  email: EmailPolicy;
+  /** Today's email send count vs the daily cap (informational). */
+  emailUsage: { sentToday: number; cap: number };
+}
+
 const DEFAULT_ENTRYPOINT = "src/index.js";
 
 /** Reserved app_data scope for the realtime engine's own state (see coordinator). */
@@ -59,6 +99,25 @@ const ROOM_SCOPE = "__room__";
  */
 const EGRESS_SCOPE = "__egress__";
 const EGRESS_KEY = "allow";
+
+/**
+ * Reserved app_data scope for per-app secrets (API keys / credentials). Held in
+ * TRUSTED storage: the untrusted app can never read a value directly. Values are
+ * used host-side (e.g. injected into a mediated fetch header) or, only when a
+ * secret is explicitly flagged `readable`, handed to the app via
+ * `requestSecrets().get`. Each row is JSON `{ v: string, r: boolean }`.
+ */
+const SECRETS_SCOPE = "__secrets__";
+const SECRET_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+
+/**
+ * Reserved app_data scope for the per-app email policy (allowed senders /
+ * recipients) and the rolling daily send counter. Trusted: the app can never set
+ * policy — only the host `/api/email` route can. Key `policy` holds the JSON
+ * EmailPolicy; keys `sent:<YYYY-MM-DD>` hold that day's send count.
+ */
+const EMAIL_SCOPE = "__email__";
+const EMAIL_POLICY_KEY = "policy";
 
 /**
  * Reserved app_data scope tracking which code version the app's OWN data (store/
@@ -99,6 +158,28 @@ const VERSION_HISTORY_KEEP = 50;
 /** How often to sweep old version history (seconds). */
 const VERSION_GC_INTERVAL_SECONDS = 24 * 60 * 60;
 
+/**
+ * Does recipient `addr` match an email allowlist entry? Entries are either an
+ * exact address ("a@b.com") or a domain ("b.com" / "*.b.com" subdomain wildcard).
+ */
+function recipientAllowed(addr: string, allow: string[]): boolean {
+  const a = addr.trim().toLowerCase();
+  const domain = a.includes("@") ? a.slice(a.lastIndexOf("@") + 1) : a;
+  for (const raw of allow) {
+    const entry = raw.trim().toLowerCase();
+    if (!entry) continue;
+    if (entry.includes("@")) {
+      if (a === entry) return true;
+    } else if (entry.startsWith("*.")) {
+      const suffix = entry.slice(1); // ".b.com"
+      if (domain.endsWith(suffix) && domain.length > suffix.length) return true;
+    } else if (domain === entry) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Encode a string to a standalone ArrayBuffer (RPC-serializable body). */
 function encodeUtf8(text: string): ArrayBuffer {
   const bytes = new TextEncoder().encode(text);
@@ -111,42 +192,69 @@ export class AppHost extends Agent<Env, HostState> {
   initialState: HostState = {
     activeVersion: 0,
     status: "ready",
-    // The one hosted app, chosen by the SINGLE source of truth in the registry.
-    // Swap DEFAULT_TEMPLATE_ID there (e.g. "tictactoe" or "counter") to build a
-    // different app on this framework — no other edit needed.
+    // Placeholder until the room is seeded. The ACTUAL app is chosen per-room at
+    // create time (runtime template selection — see #ensureSeeded / create());
+    // DEFAULT_TEMPLATE_ID is only the fallback for rooms opened without a create.
     templateId: DEFAULT_TEMPLATE_ID,
     lastError: null
   };
 
-  async onStart(props?: { template?: string }): Promise<void> {
+  async onStart(): Promise<void> {
     db.createTables(this);
 
-    // Seed once, on first boot, from the chosen template (default poker).
-    if (!db.hasAnyVersion(this)) {
-      const template = getTemplate(props?.template ?? this.state.templateId);
-      const version = db.insertVersion(this, template.files, `seed:${template.id}`);
-      // Precompile the seed so the very first request runs warm (limitation #4).
-      await this.#storeBuild(template.files);
-      // Seed the egress allowlist from the template (empty => no egress).
-      if (template.egress && template.egress.length > 0) {
-        db.appDataPut(this, EGRESS_SCOPE, EGRESS_KEY, JSON.stringify(template.egress));
-      }
-      // Fresh data starts already "upgraded" to the seed version — there is no
-      // prior data to migrate, so onUpgrade must NOT run on the initial seed (#10).
-      db.appDataPut(this, UPGRADE_SCOPE, UPGRADE_KEY, String(version));
-      this.setState({
-        ...this.state,
-        activeVersion: version,
-        templateId: template.id,
-        status: "ready",
-        lastError: null
-      });
-    }
+    // NOTE: seeding is DEFERRED (see #ensureSeeded), not done here. onStart runs
+    // (awaited) before any RPC, so seeding here would ALWAYS pick DEFAULT before a
+    // caller could choose a template — defeating runtime template selection. Every
+    // entry point lazily seeds instead: `create(id)` from the lobby seeds the
+    // CHOSEN template; any other first touch seeds the default (back-compat).
 
     // Recurring version-history GC. `scheduleEvery` is idempotent, so calling it
     // on every DO wake (onStart) creates exactly one schedule, not a duplicate
     // per boot. Backed by a DO alarm.
     await this.scheduleEvery(VERSION_GC_INTERVAL_SECONDS, "gcVersions");
+  }
+
+  /**
+   * Seed the room's code ONCE, from the given template (or the default). Idempotent
+   * and cheap: a no-op after the first version exists, so it's safe to call at the
+   * top of every entry point. This is where runtime template selection lands — the
+   * FIRST caller to touch a fresh room decides its template. `create(id)` (the
+   * lobby) passes an explicit id; all other paths pass none and get the default.
+   */
+  async #ensureSeeded(templateId?: string): Promise<void> {
+    if (db.hasAnyVersion(this)) return;
+    const template = getTemplate(templateId ?? this.state.templateId);
+    const version = db.insertVersion(this, template.files, `seed:${template.id}`);
+    // Precompile the seed so the very first request runs warm (limitation #4).
+    await this.#storeBuild(template.files);
+    // Seed the egress allowlist from the template (empty => no egress).
+    if (template.egress && template.egress.length > 0) {
+      db.appDataPut(this, EGRESS_SCOPE, EGRESS_KEY, JSON.stringify(template.egress));
+    }
+    // Fresh data starts already "upgraded" to the seed version — there is no
+    // prior data to migrate, so onUpgrade must NOT run on the initial seed (#10).
+    db.appDataPut(this, UPGRADE_SCOPE, UPGRADE_KEY, String(version));
+    this.setState({
+      ...this.state,
+      activeVersion: version,
+      templateId: template.id,
+      status: "ready",
+      lastError: null
+    });
+  }
+
+  /**
+   * Create/seed this room from a chosen template (runtime template selection).
+   * Called by the lobby BEFORE the room page loads, so the first-touch seed uses
+   * the picked template. Idempotent: if the room already has code (someone got
+   * here first, or it was created before), it is NOT re-seeded — the existing app
+   * is returned unchanged. An unknown `templateId` falls back to the default.
+   * Returns `{ state, created }` so the caller can tell whether it seeded.
+   */
+  async create(templateId?: string): Promise<{ state: HostState; created: boolean }> {
+    const existed = db.hasAnyVersion(this);
+    await this.#ensureSeeded(templateId);
+    return { state: this.state, created: !existed };
   }
 
   // ── Run the current app (preview) ──
@@ -159,6 +267,7 @@ export class AppHost extends Agent<Env, HostState> {
     headers: [string, string][];
     body: string | null;
   }): Promise<PreviewResult> {
+    await this.#ensureSeeded();
     const files = this.currentFilesSync();
     if (files.length === 0) {
       return {
@@ -175,6 +284,7 @@ export class AppHost extends Agent<Env, HostState> {
     });
 
     try {
+      const limits = this.#limitsSync();
       const { response } = await runApp({
         env: this.env,
         instance: this.name,
@@ -182,7 +292,8 @@ export class AppHost extends Agent<Env, HostState> {
         files,
         entrypoint: this.entrypoint(),
         request,
-        resolvePrebuilt: this.resolvePrebuilt
+        resolvePrebuilt: this.resolvePrebuilt,
+        limits: { cpuMs: limits.cpuMs, subRequests: limits.subRequests }
       });
       return {
         status: response.status,
@@ -242,6 +353,7 @@ export class AppHost extends Agent<Env, HostState> {
   }
 
   async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+    await this.#ensureSeeded();
     const url = new URL(ctx.request.url);
     // Read-only state subscriber (editor chrome): skip the coordinator so it gets
     // no seat/presence. The base Agent already sent the initial `cf_agent_state`
@@ -271,9 +383,49 @@ export class AppHost extends Agent<Env, HostState> {
     await this.#coordinator().onClose(connection as Connection<ConnState>);
   }
 
+  // ── App-driven realtime bridge (broker.requestRoom → ScopedRoom) ──
+  //
+  // The untrusted app is a pure per-request function; it holds no sockets. These
+  // TRUSTED methods let its Room capability push to THIS room's connected clients
+  // (the sockets live here in AppHost). Reachable only host-side by the ScopedRoom
+  // stub over RPC — never by the app directly (it holds only `env.SYSTEM`). Each
+  // frame is `{ type: "app", data }` so it never collides with coordinator frames.
+  // Editor spectators (SPECTATOR_TOKEN) are always excluded.
+
+  /** Fan a message out to every connected game client. Returns the count sent. */
+  async appBroadcast(message: unknown): Promise<number> {
+    const frame = JSON.stringify({ type: "app", data: message });
+    let n = 0;
+    for (const c of this.getConnections() as Iterable<Connection<ConnState>>) {
+      if (c.state?.token === SPECTATOR_TOKEN) continue;
+      c.send(frame);
+      n++;
+    }
+    return n;
+  }
+
+  /** Send a message only to the client(s) holding `seat`. Returns the count sent. */
+  async appSendToSeat(seat: string, message: unknown): Promise<number> {
+    const frame = JSON.stringify({ type: "app", data: message });
+    let n = 0;
+    for (const c of this.getConnections() as Iterable<Connection<ConnState>>) {
+      if (c.state?.token === SPECTATOR_TOKEN) continue;
+      if (c.state?.seat !== seat) continue;
+      c.send(frame);
+      n++;
+    }
+    return n;
+  }
+
+  /** Presence snapshot (seat pool + who's connected) for the app's Room handle. */
+  async appPresence(): Promise<RoomPresence> {
+    return this.#coordinator().presence();
+  }
+
   // ── File management actions (called over RPC by the host worker) ──
 
   async getFiles(): Promise<AppFile[]> {
+    await this.#ensureSeeded();
     return this.currentFilesSync();
   }
 
@@ -283,11 +435,19 @@ export class AppHost extends Agent<Env, HostState> {
    * response) — so the app's HTTP data path no longer flows through this DO.
    * See server.ts handlePreview.
    */
-  async getRunManifest(): Promise<{ files: AppFile[]; entrypoint: string; version: number }> {
+  async getRunManifest(): Promise<{
+    files: AppFile[];
+    entrypoint: string;
+    version: number;
+    limits: RunLimits;
+  }> {
+    await this.#ensureSeeded();
+    const limits = this.#limitsSync();
     return {
       files: this.currentFilesSync(),
       entrypoint: this.entrypoint(),
-      version: this.state.activeVersion
+      version: this.state.activeVersion,
+      limits: { cpuMs: limits.cpuMs, subRequests: limits.subRequests }
     };
   }
 
@@ -298,15 +458,48 @@ export class AppHost extends Agent<Env, HostState> {
   }
 
   async getStatus(): Promise<HostState> {
+    await this.#ensureSeeded();
     return this.state;
   }
 
+  /**
+   * A single consistent snapshot for the Resources panel: the capability catalog
+   * (from the manifest) joined with this app's current per-app configuration.
+   * Read-only; the panel writes through the existing `/api/*` routes.
+   */
+  async getResources(): Promise<AppResources> {
+    await this.#ensureSeeded();
+    const template = getTemplate(this.state.templateId);
+    const declared = new Set<string>(template.declares ?? []);
+    const limits = this.#limitsSync();
+    const dayKey = `sent:${new Date().toISOString().slice(0, 10)}`;
+    const sentToday = Number(db.appDataGet(this, EMAIL_SCOPE, dayKey) ?? 0);
+    return {
+      templateId: this.state.templateId,
+      capabilities: CAPABILITIES.map((c) => ({
+        id: c.id,
+        label: c.label,
+        summary: c.summary,
+        available: c.available,
+        configurable: c.configurable,
+        declared: declared.has(c.id)
+      })),
+      egress: await this.getEgressAllowlist(),
+      limits,
+      secrets: await this.listSecrets(),
+      email: this.#emailPolicySync(),
+      emailUsage: { sentToday, cap: limits.emailPerDay }
+    };
+  }
+
   async listVersions(): Promise<db.VersionRow[]> {
+    await this.#ensureSeeded();
     return db.listVersions(this);
   }
 
   /** Re-seed the app from its template as a new version (a clean slate). */
   async resetToTemplate(): Promise<number> {
+    await this.#ensureSeeded();
     const template = getTemplate(this.state.templateId);
     return this.setFiles(template.files, `reset:${template.id}`);
   }
@@ -521,6 +714,189 @@ export class AppHost extends Agent<Env, HostState> {
       : [];
     db.appDataPut(this, EGRESS_SCOPE, EGRESS_KEY, JSON.stringify(clean));
     return clean;
+  }
+
+  // ── secrets (trusted policy; resolved host-side by the secret-consuming
+  //    capabilities, written only by the host /api/secrets route; the app can
+  //    never read a value unless it is explicitly flagged `readable`) ──
+
+  /** Secret NAMES + readable flags only — never values. */
+  async listSecrets(): Promise<{ name: string; readable: boolean }[]> {
+    return db.appDataList(this, SECRETS_SCOPE).map((name) => {
+      let readable = false;
+      try {
+        readable = !!(JSON.parse(db.appDataGet(this, SECRETS_SCOPE, name) ?? "{}") as { r?: boolean }).r;
+      } catch {
+        // treat unparseable as not-readable
+      }
+      return { name, readable };
+    });
+  }
+
+  /**
+   * Resolve a secret's raw value (TRUSTED — reachable only by host-side capability
+   * stubs, never by the app). `requireReadable` gates the app-facing read path;
+   * host-side injection omits it (the value never enters the sandbox).
+   */
+  async resolveSecret(name: string, opts?: { requireReadable?: boolean }): Promise<string> {
+    const raw = db.appDataGet(this, SECRETS_SCOPE, name);
+    if (raw === null) {
+      throw new Error(`Secret "${name}" is not set. Add it in the room's secret settings.`);
+    }
+    const parsed = JSON.parse(raw) as { v: string; r: boolean };
+    if (opts?.requireReadable && !parsed.r) {
+      throw new Error(
+        `Secret "${name}" is not readable by the app. Either use it via secretHeaders ` +
+          `(injected without reading), or mark it readable in the room's secret settings.`
+      );
+    }
+    return parsed.v;
+  }
+
+  /** Set (or overwrite) a secret. Host-only; not reachable by the app. */
+  async setSecret(name: string, value: string, readable = false): Promise<{ name: string; readable: boolean }> {
+    if (!SECRET_NAME_RE.test(name)) {
+      throw new Error(
+        `Invalid secret name "${name}". Use letters, digits or "_" (must not start with a digit).`
+      );
+    }
+    db.appDataPut(this, SECRETS_SCOPE, name, JSON.stringify({ v: String(value), r: !!readable }));
+    return { name, readable: !!readable };
+  }
+
+  /** Delete a secret. Host-only; not reachable by the app. */
+  async deleteSecret(name: string): Promise<void> {
+    db.appDataDelete(this, SECRETS_SCOPE, name);
+  }
+
+  // ── email policy (trusted; read + reserved by ScopedEmail, written only by
+  //    the host /api/email route) ──
+
+  #emailPolicySync(): EmailPolicy {
+    const raw = db.appDataGet(this, EMAIL_SCOPE, EMAIL_POLICY_KEY);
+    if (!raw) return { allowedFrom: [], allowRecipients: [] };
+    try {
+      const p = JSON.parse(raw) as Partial<EmailPolicy>;
+      return {
+        allowedFrom: Array.isArray(p.allowedFrom) ? p.allowedFrom : [],
+        defaultFrom: typeof p.defaultFrom === "string" ? p.defaultFrom : undefined,
+        fromName: typeof p.fromName === "string" ? p.fromName : undefined,
+        allowRecipients: Array.isArray(p.allowRecipients) ? p.allowRecipients : []
+      };
+    } catch {
+      return { allowedFrom: [], allowRecipients: [] };
+    }
+  }
+
+  /** The app's email policy (senders/recipients). Host-only surface for /api/email. */
+  async getEmailPolicy(): Promise<EmailPolicy> {
+    return this.#emailPolicySync();
+  }
+
+  /** Replace the app's email policy (host-only; not reachable by the app). */
+  async setEmailPolicy(policy: Partial<EmailPolicy>): Promise<EmailPolicy> {
+    const clean: EmailPolicy = {
+      allowedFrom: Array.isArray(policy.allowedFrom)
+        ? policy.allowedFrom.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
+        : [],
+      allowRecipients: Array.isArray(policy.allowRecipients)
+        ? policy.allowRecipients.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
+        : []
+    };
+    const df = typeof policy.defaultFrom === "string" ? policy.defaultFrom.trim().toLowerCase() : "";
+    if (df) clean.defaultFrom = df;
+    const fn = typeof policy.fromName === "string" ? policy.fromName.trim() : "";
+    if (fn) clean.fromName = fn;
+    db.appDataPut(this, EMAIL_SCOPE, EMAIL_POLICY_KEY, JSON.stringify(clean));
+    return clean;
+  }
+
+  /**
+   * Validate a send against policy AND reserve a slot in today's counter — all in
+   * ONE serialized DO method (no lost counts under concurrent sends). Returns the
+   * resolved sender. The slow `env.EMAIL.send()` runs in ScopedEmail AFTER this,
+   * so the network call never holds AppHost's input gate (cf. limitation #3).
+   */
+  async reserveEmail(req: { from?: string; recipients: string[] }): Promise<ResolvedSender> {
+    const policy = this.#emailPolicySync();
+    if (policy.allowedFrom.length === 0) {
+      throw new Error(
+        "Email is not configured for this app. Add an allowed From address in the room's email settings."
+      );
+    }
+    const from = (req.from ?? policy.defaultFrom ?? policy.allowedFrom[0]).toLowerCase();
+    if (!policy.allowedFrom.includes(from)) {
+      throw new Error(
+        `Sender "${from}" is not allowed. Allowed: ${policy.allowedFrom.join(", ")}. ` +
+          "Set allowed senders in the room's email settings."
+      );
+    }
+    const recipients = Array.isArray(req.recipients) ? req.recipients : [];
+    if (recipients.length === 0) throw new Error("At least one recipient is required.");
+    if (policy.allowRecipients.length > 0) {
+      for (const r of recipients) {
+        if (!recipientAllowed(r, policy.allowRecipients)) {
+          throw new Error(
+            `Recipient "${r}" is not on this app's recipient allowlist. ` +
+              "Add it (or its domain) in the room's email settings."
+          );
+        }
+      }
+    }
+    // Daily cap (reserve now; the send follows).
+    const cap = this.#limitsSync().emailPerDay;
+    const dayKey = `sent:${new Date().toISOString().slice(0, 10)}`;
+    const current = Number(db.appDataGet(this, EMAIL_SCOPE, dayKey) ?? 0);
+    if (current + 1 > cap) {
+      throw new Error(`Daily email limit reached (${cap}/day). Raise it in the room's resource settings.`);
+    }
+    db.appDataPut(this, EMAIL_SCOPE, dayKey, String(current + 1));
+    return { email: from, name: policy.fromName };
+  }
+
+  // ── resource limits (trusted policy; read by the runner + ScopedFetcher +
+  //    AppData, written only by the host /api/limits route) ──
+
+  /** Synchronous read of the app's resolved limits (used on the run hot path). */
+  #limitsSync(): AppLimits {
+    return parseLimits(db.appDataGet(this, LIMITS_SCOPE, LIMITS_KEY));
+  }
+
+  /** The app's fully-resolved resource limits (defaults merged with overrides). */
+  async getLimits(): Promise<AppLimits> {
+    return this.#limitsSync();
+  }
+
+  /**
+   * Merge a partial override onto the current limits, persist it (trusted
+   * storage — the app can't reach this), and push the storage caps down to the
+   * AppData DO so the store hot path enforces them locally without funnelling
+   * back through AppHost. Returns the fully-resolved limits.
+   */
+  async setLimits(partial: Partial<AppLimits>): Promise<AppLimits> {
+    const merged = mergeLimits(partial, this.#limitsSync());
+    db.appDataPut(this, LIMITS_SCOPE, LIMITS_KEY, JSON.stringify(merged));
+    try {
+      const id = this.env.APP_DATA.idFromName(this.name);
+      await this.env.APP_DATA.get(id).setStorageLimits({
+        maxValueBytes: merged.storeMaxValueBytes,
+        maxTotalBytes: merged.storeMaxTotalBytes
+      });
+    } catch {
+      // Best-effort: AppData enforces its own generous defaults if this fails;
+      // the push retries on the next setLimits call.
+    }
+    try {
+      const sqlId = this.env.APP_SQL.idFromName(this.name);
+      await this.env.APP_SQL.get(sqlId).setSqlLimits({
+        maxRows: merged.sqlMaxRows,
+        maxDbBytes: merged.sqlMaxDbBytes
+      });
+    } catch {
+      // Best-effort: AppSql keeps its own generous defaults if this fails; the
+      // push retries on the next setLimits call.
+    }
+    return merged;
   }
 
   // ── internals ──
