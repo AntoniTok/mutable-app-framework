@@ -42,14 +42,16 @@ Three layers, two of them swappable:
 3. **App templates** (swappable) — the actual apps, incl. their own UI. Behind
    the `AppTemplate` interface + the runtime contract.
 
-> **See it visually.** Two architecture pages ship with the framework and are
-> served by the dev server:
-> [**`/architecture`**](public/architecture.html) — a prose walkthrough of every
-> path (request, edit, realtime, capabilities, security); and
-> [**`/architecture-diagrams`**](public/architecture-diagrams.html) — two diagrams
-> (the overall **framework structure** and a single **deployed room + lobby**) with
-> every part marked *always present* vs *optional*. Open them on the running dev
-> server, or read the HTML in `public/`.
+> **See it visually.** Two architecture pages ship with the framework — rendered
+> on GitHub Pages:
+> [**Diagrams**](https://antonitok.github.io/mutable-app-framework/architecture-diagrams.html)
+> (the overall **framework structure** and a single **deployed room + lobby**, with
+> every part marked *always present* vs *optional*) and
+> [**Prose reference**](https://antonitok.github.io/mutable-app-framework/architecture.html)
+> (a walkthrough of every path — request, edit, realtime, capabilities, security).
+> Source lives in `public/` ([`architecture.html`](public/architecture.html),
+> [`architecture-diagrams.html`](public/architecture-diagrams.html)) and is also
+> served by the dev server at `/architecture` and `/architecture-diagrams`.
 
 ### Key idea: the app is untrusted
 

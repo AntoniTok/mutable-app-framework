@@ -1,0 +1,57 @@
+name: Deploy architecture docs to GitHub Pages
+
+# Publishes ONLY the self-contained architecture pages (kept in public/ as the
+# single source) to GitHub Pages so they render on the web instead of showing as
+# raw source in the repo view. The rest of public/ (lobby/room UI) needs the
+# wrangler-served Worker APIs, so it is intentionally not published here.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "public/architecture.html"
+      - "public/architecture-diagrams.html"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp public/architecture.html public/architecture-diagrams.html _site/
+          cat > _site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en"><head><meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <title>Mutable App Framework — Architecture</title>
+          <meta http-equiv="refresh" content="0; url=architecture-diagrams.html" />
+          <style>body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1117;color:#e6edf3;padding:48px;line-height:1.6}a{color:#2f81f7}</style>
+          </head><body>
+          <p>Redirecting to the <a href="architecture-diagrams.html">architecture diagrams</a>…</p>
+          <p>Or read the <a href="architecture.html">prose architecture reference</a>.</p>
+          </body></html>
+          HTML
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
