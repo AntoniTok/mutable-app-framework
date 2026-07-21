@@ -78,6 +78,23 @@
       .tool-chip.done { color: var(--ok); border-color: var(--ok); }
       .tool-chip.err { color: var(--err); border-color: var(--err); }
       #chatInput { flex: 1; resize: vertical; }
+      /* Resources panel */
+      .res-group { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; }
+      .res-group > h3 { font-size: 12px; margin: 0 0 4px; display: flex; align-items: center; gap: 8px; }
+      .res-group .desc { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+      .badge { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 1px 6px; border-radius: 8px; border: 1px solid var(--border); color: var(--muted); }
+      .badge.on { color: var(--accent); border-color: var(--accent); }
+      .badge.ok { color: var(--ok); border-color: var(--ok); }
+      .badge.off { color: var(--err); border-color: var(--err); }
+      .res-grid { display: grid; grid-template-columns: 1fr auto; gap: 6px 8px; align-items: center; }
+      .res-grid label { font-size: 12px; color: var(--muted); }
+      .res-grid input { width: 140px; }
+      .res-field { margin-bottom: 8px; }
+      .res-field label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+      .res-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+      .res-hint { font-size: 11px; color: var(--muted); }
+      .res-hint.ok { color: var(--ok); } .res-hint.err { color: var(--err); }
+      .secret-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
     </style>
   </head>
   <body>
@@ -93,6 +110,7 @@
       <button class="ghost on edit-only" id="toggleControls">Controls</button>
       <button class="ghost on edit-only" id="toggleChat">Chat</button>
       <button class="ghost edit-only" id="toggleCode">Code</button>
+      <button class="ghost edit-only" id="toggleResources">Resources</button>
       <button class="ghost edit-only" id="toggleHistory">History</button>
     </header>
     <main>
@@ -126,6 +144,14 @@
             <button class="ghost" id="reload">Reload</button>
             <span class="hint" id="saveHint"></span>
           </div>
+        </div>
+      </div>
+
+      <!-- Drawer: resources/capabilities + per-app config. Toggle "Resources". -->
+      <div class="col drawer hidden edit-only" id="resourcesDrawer">
+        <div class="section grow" style="overflow:auto;">
+          <h2>Resources <span id="resStatus" class="meta"></span></h2>
+          <div id="resBody">loading…</div>
         </div>
       </div>
 
@@ -224,6 +250,10 @@
       $("toggleCode").onclick = () => toggleDrawer("codeDrawer", $("toggleCode"));
       $("toggleHistory").onclick = () => toggleDrawer("historyDrawer", $("toggleHistory"));
       $("toggleChat").onclick = () => toggleDrawer("chatDrawer", $("toggleChat"));
+      $("toggleResources").onclick = () => {
+        toggleDrawer("resourcesDrawer", $("toggleResources"));
+        if (!$("resourcesDrawer").classList.contains("hidden")) Resources.load();
+      };
 
       // Toggle in-column sections (top controls bar). Visible by default in edit
       // mode; hiding it gives the preview more room.
@@ -598,6 +628,179 @@
       $("editor").addEventListener("keydown", (e) => {
         if (e.key === "Tab") { e.preventDefault(); const t = e.target; const s = t.selectionStart; t.value = t.value.slice(0, s) + "  " + t.value.slice(t.selectionEnd); t.selectionStart = t.selectionEnd = s + 2; }
       });
+
+      // ── Resources panel ──
+      // Renders the capability catalog (from the server's manifest — the single
+      // source of truth) plus this app's per-app config: resource limits, egress
+      // allowlist, secrets (names only), and email policy. Reads one snapshot via
+      // GET /api/resources; writes through the existing POST /api/{limits,egress,
+      // secrets,email} routes, then reloads. Nothing here is app-reachable — it's
+      // trusted host config surfaced in the editor chrome.
+      const Resources = (() => {
+        // Tiny DOM helper: el("div", {class:"x"}, [child, "text"]).
+        function el(tag, props, kids) {
+          const n = document.createElement(tag);
+          for (const [k, v] of Object.entries(props || {})) {
+            if (k === "class") n.className = v;
+            else if (k === "text") n.textContent = v;
+            else if (k.startsWith("on") && typeof v === "function") n[k] = v;
+            else if (v != null) n.setAttribute(k, v);
+          }
+          for (const kid of [].concat(kids || [])) {
+            if (kid == null) continue;
+            n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+          }
+          return n;
+        }
+        // Human labels for the AppLimits keys (falls back to the raw key).
+        const LIMIT_LABELS = {
+          cpuMs: "CPU per run (ms)", subRequests: "Sub-requests per run",
+          fetchTimeoutMs: "Fetch timeout (ms)", fetchMaxBytes: "Fetch max bytes",
+          fetchMaxRedirects: "Fetch max redirects", storeMaxValueBytes: "Store max value (bytes)",
+          storeMaxTotalBytes: "Store max total (bytes)", emailPerDay: "Email per day"
+        };
+        function status(msg, cls) {
+          const s = $("resStatus");
+          s.textContent = msg ? "— " + msg : "";
+          s.className = "meta " + (cls || "");
+        }
+
+        // Resource limits: one number input per AppLimits key; Save posts them all
+        // (the server clamps + merges).
+        function limitsGroup(limits) {
+          const grid = el("div", { class: "res-grid" });
+          const inputs = {};
+          for (const [key, val] of Object.entries(limits)) {
+            inputs[key] = el("input", { type: "number", min: "0", value: String(val) });
+            grid.append(el("label", { text: LIMIT_LABELS[key] || key }), inputs[key]);
+          }
+          const hint = el("span", { class: "res-hint" });
+          const save = el("button", { text: "Save limits", onclick: async () => {
+            const patch = {};
+            for (const [k, inp] of Object.entries(inputs)) patch[k] = Number(inp.value);
+            hint.textContent = "saving…"; hint.className = "res-hint";
+            try { await api("/api/limits", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limits: patch }) });
+              hint.textContent = "saved (clamped to allowed range)"; hint.className = "res-hint ok"; load();
+            } catch (e) { hint.textContent = e.message; hint.className = "res-hint err"; }
+          } });
+          return el("div", { class: "res-group" }, [
+            el("h3", {}, ["Resource limits ", el("span", { class: "badge on", text: "#5" })]),
+            el("p", { class: "desc", text: "Generous defaults, clamped server-side. Applied per app run and per capability." }),
+            grid, el("div", { class: "res-actions" }, [save, hint])
+          ]);
+        }
+
+        // Egress allowlist editor (the "fetch" capability's config).
+        function egressEditor(hosts) {
+          const ta = el("textarea", { rows: "3", placeholder: "api.example.com\n(one host per line)" });
+          ta.value = (hosts || []).join("\n");
+          const hint = el("span", { class: "res-hint" });
+          const save = el("button", { text: "Save allowlist", onclick: async () => {
+            const allow = ta.value.split("\n").map((s) => s.trim()).filter(Boolean);
+            hint.textContent = "saving…"; hint.className = "res-hint";
+            try { await api("/api/egress", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ allow }) });
+              hint.textContent = "saved"; hint.className = "res-hint ok"; load();
+            } catch (e) { hint.textContent = e.message; hint.className = "res-hint err"; }
+          } });
+          return el("div", {}, [
+            el("div", { class: "res-field" }, [el("label", { text: "Allowed hosts (requestFetch can only reach these)" }), ta]),
+            el("div", { class: "res-actions" }, [save, hint])
+          ]);
+        }
+
+        // Secrets editor (names + readable flag; values are write-only).
+        function secretsEditor(secrets) {
+          const list = el("div", {});
+          if (!secrets.length) list.append(el("p", { class: "res-hint", text: "No secrets set." }));
+          for (const s of secrets) {
+            const del = el("button", { class: "ghost", text: "delete", onclick: async () => {
+              if (!confirm(`Delete secret "${s.name}"?`)) return;
+              await api("/api/secrets", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: s.name, delete: true }) });
+              load();
+            } });
+            list.append(el("div", { class: "secret-row" }, [
+              el("span", {}, [s.name + " ", el("span", { class: "badge " + (s.readable ? "ok" : ""), text: s.readable ? "readable" : "use-only" })]),
+              del
+            ]));
+          }
+          const name = el("input", { placeholder: "NAME" });
+          const value = el("input", { placeholder: "value", type: "password" });
+          const readable = el("input", { type: "checkbox" });
+          const hint = el("span", { class: "res-hint" });
+          const add = el("button", { text: "Add / update", onclick: async () => {
+            hint.textContent = "saving…"; hint.className = "res-hint";
+            try { await api("/api/secrets", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: name.value.trim(), value: value.value, readable: readable.checked }) });
+              hint.textContent = "saved"; hint.className = "res-hint ok"; load();
+            } catch (e) { hint.textContent = e.message; hint.className = "res-hint err"; }
+          } });
+          return el("div", {}, [
+            list,
+            el("div", { class: "res-field", style: "margin-top:8px;" }, [el("label", { text: "Add or overwrite a secret (value never leaves the server)" }),
+              el("div", { class: "row" }, [name, value]),
+              el("label", { class: "res-hint", style: "display:flex;gap:6px;align-items:center;margin-top:6px;" }, [readable, "app may read the raw value"])]),
+            el("div", { class: "res-actions" }, [add, hint])
+          ]);
+        }
+
+        // Email policy editor.
+        function emailEditor(policy, usage) {
+          const from = el("textarea", { rows: "2", placeholder: "noreply@example.com" });
+          from.value = (policy.allowedFrom || []).join("\n");
+          const recips = el("textarea", { rows: "2", placeholder: "example.com  |  *.example.com  |  a@example.com  (blank = any)" });
+          recips.value = (policy.allowRecipients || []).join("\n");
+          const def = el("input", { placeholder: "default sender (optional)", value: policy.defaultFrom || "" });
+          const name = el("input", { placeholder: "From display name (optional)", value: policy.fromName || "" });
+          const hint = el("span", { class: "res-hint" });
+          const save = el("button", { text: "Save email policy", onclick: async () => {
+            const p = {
+              allowedFrom: from.value.split("\n").map((s) => s.trim()).filter(Boolean),
+              allowRecipients: recips.value.split("\n").map((s) => s.trim()).filter(Boolean),
+              defaultFrom: def.value.trim(), fromName: name.value.trim()
+            };
+            hint.textContent = "saving…"; hint.className = "res-hint";
+            try { await api("/api/email", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ policy: p }) });
+              hint.textContent = "saved"; hint.className = "res-hint ok"; load();
+            } catch (e) { hint.textContent = e.message; hint.className = "res-hint err"; }
+          } });
+          return el("div", {}, [
+            el("p", { class: "res-hint", text: `Sent today: ${usage.sentToday} / ${usage.cap} (cap is the "Email per day" limit above).` }),
+            el("div", { class: "res-field" }, [el("label", { text: "Allowed senders (From must be one of these)" }), from]),
+            el("div", { class: "res-field" }, [el("label", { text: "Allowed recipients (blank = any)" }), recips]),
+            el("div", { class: "res-field" }, [el("label", { text: "Default sender" }), def]),
+            el("div", { class: "res-field" }, [el("label", { text: "From display name" }), name]),
+            el("div", { class: "res-actions" }, [save, hint])
+          ]);
+        }
+
+        // One card per capability from the catalog.
+        function capGroup(cap, r) {
+          const badges = [];
+          badges.push(el("span", { class: "badge " + (cap.available ? "ok" : "off"), text: cap.available ? "available" : "reserved" }));
+          if (cap.declared) badges.push(el("span", { class: "badge on", text: "used by app" }));
+          const head = el("h3", {}, [cap.label + " ", ...badges]);
+          const kids = [head, el("p", { class: "desc", text: cap.summary })];
+          if (cap.id === "fetch") kids.push(egressEditor(r.egress));
+          else if (cap.id === "secrets") kids.push(secretsEditor(r.secrets));
+          else if (cap.id === "email") kids.push(emailEditor(r.email, r.emailUsage));
+          return el("div", { class: "res-group" }, kids);
+        }
+
+        async function load() {
+          status("loading…");
+          const body = $("resBody");
+          try {
+            const r = await api("/api/resources");
+            body.innerHTML = "";
+            body.append(limitsGroup(r.limits));
+            for (const cap of r.capabilities) body.append(capGroup(cap, r));
+            status("app: " + r.templateId, "ok");
+          } catch (e) {
+            body.textContent = "error: " + e.message;
+            status("error", "err");
+          }
+        }
+        return { load };
+      })();
 
       (async () => { await syncAll(); })();
     </script>
