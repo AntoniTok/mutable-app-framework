@@ -13,46 +13,102 @@ Object; each request runs the live version in an isolated Dynamic Worker; edits
 
 Resolved: **#1** state preservation across edits, **#2** atomic KV (`incr`/`cas`),
 **#3** app data in a direct-reached top-level `AppData` DO (no AppHost funnel),
-**#4** precompiled builds off the request path, **#7** fs/blob/egress capabilities,
+**#4** precompiled builds off the request path, **#7** fs/blob/egress/secrets/email/room/scheduler/sql
+capabilities (catalog in `capabilities/manifest.ts`),
 **#9** template literals allowed (no-backtick rule dropped), **#10** `onUpgrade`
-app-data migration. Outstanding (do NOT assume these are handled): **#5** no
-quotas/resource-limits/rate-limiting, **#6** no auth (rooms are guessable),
-**#8** build-gate catches syntax/type errors only (not logic), **#11**
+app-data migration, **#12** SSRF-safe mediated egress (manual redirect re-validation
++ response size/timeout caps). Partially resolved: **#5** — per-run
+`limits.cpuMs`/`subRequests`, mediated-fetch caps, per-value/per-app store
+byte quotas, a daily email cap (`emailPerDay`), a pending-scheduled-tasks cap
+(`maxScheduledTasks`), and SQL caps (`sqlMaxRows` per query + `sqlMaxDbBytes`
+DB size) are DONE and per-app configurable (`src/config/limits.ts`,
+trusted `__limits__` scope, `GET`/`POST /api/limits`); request-rate throttling is
+still absent. Outstanding (do NOT assume these are handled): **#6** no auth (rooms are
+guessable), **#8** build-gate catches syntax/type errors only (not logic), **#11**
 preview-grade APIs + bundle/model ceilings. Full table: README "Hardening status".
+
+**Guardrail principle (applies to all future caps):** every limit ships GENEROUS
+by default and per-app configurable. Defaults + clamps live ONLY in
+`src/config/limits.ts` (`AppLimits`, `DEFAULT_LIMITS`, `mergeLimits`, `parseLimits`).
+Overrides are stored in AppHost's trusted `__limits__` scope (the untrusted app can
+never raise its own ceilings) and pushed to `AppData` for local store-quota
+enforcement (no hot-path funnel). Add new limit fields there, not inline.
 
 ## Where things are
 
-- `src/server.ts` — entry Worker; routes `/api/*` (incl. `/api/egress`),
-  `/preview/*`, `/agents/*`. `handlePreview` runs the app IN the host worker and
-  STREAMS the response. Exports the DOs + all capability entrypoints (store, fs,
-  blob, fetch) + `DynamicWorkerTail`.
+- `src/server.ts` — entry Worker; routes `/api/*` (incl. `/api/egress`,
+  `/api/limits`, `/api/secrets`, `/api/email`, and the read-only `/api/resources`
+  snapshot for the Resources panel), `/preview/*`, `/agents/*`. `handlePreview`
+  runs the app IN the host worker and STREAMS the response. Exports the DOs + all
+  capability entrypoints (store, fs, blob, fetch, secrets, email) + `DynamicWorkerTail`.
 - `src/agent/app-host.ts` — the Agent (DO). Source of truth for CODE + all
   actions. Persists precompiled builds; holds the egress allowlist; runs the app's
   optional `onUpgrade` data migration on each forward promote (`#runDataUpgrade`,
   tracked in the `__upgrade__` scope — limitation #10); exposes `getRunManifest`/
-  `getBuild`/`resolvePrebuilt` for the host-worker run path. It does NOT hold app
-  runtime data — that lives in the separate `AppData` DO.
+  `getBuild`/`resolvePrebuilt` for the host-worker run path, and `getResources()`
+  (the Resources-panel snapshot: capability catalog from the manifest joined with
+  the per-app egress/limits/secrets/email config). It does NOT hold app runtime
+  data — that lives in the separate `AppData` DO.
 - `src/agent/app-data.ts` — the `AppData` Durable Object: an app's runtime data
   (key/value store + dofs filesystem) in its OWN isolated SQLite, one per room id.
   Reached DIRECTLY by the `ScopedStore`/`ScopedFilesystem` capability stubs (2
   hops, never through AppHost — limitation #3). Bundles the tree-shaken dofs fs
   layer; needs `nodejs_compat` (already enabled worker-wide).
+- `src/agent/app-scheduler.ts` — the `AppScheduler` Durable Object: the app's task
+  scheduler (`broker.requestScheduler`), one per room id, with its OWN SQLite +
+  a single DO alarm. Reached DIRECTLY by the `ScopedScheduler` stub. When a task
+  is due its `alarm()` loads the app's live code from AppHost by RPC
+  (`getRunManifest`/`getBuild`) and runs the app's `onSchedule(env, ctx)` export in
+  the sandbox via `runner.runSchedule` (full `env.SYSTEM`). One-shots are deleted
+  after firing; recurring tasks advance (skipping missed slots); the alarm re-arms
+  to   the next earliest. Migration `tag: "v4"` in `wrangler.jsonc`.
+- `src/agent/app-sql.ts` — the `AppSql` Durable Object: the app's private
+  RELATIONAL database (`broker.requestSql`), one per room id, with its OWN SQLite.
+  Reached DIRECTLY by the `ScopedSql` stub (limitation #3). A real SQL surface
+  (arbitrary schema + queries via `sqlExec(sql, params)` → `{rows, columnNames,
+  rowsRead, rowsWritten, lastRowId}`), distinct from AppData's flat key/value
+  store. Enforces the trusted caps LOCALLY: a per-query row cap (`sqlMaxRows`) and
+  a DB-size soft cap (`sqlMaxDbBytes`, blocks growth writes — INSERT/UPDATE/CREATE/
+  ALTER/REPLACE — while allowing SELECT/DELETE/DROP so the app can recover). Caps
+  are pushed from `AppHost.setLimits` via `setSqlLimits` and persisted in a
+  `__appsql_meta__` table. Migration `tag: "v5"` in `wrangler.jsonc`.
+- `src/config/limits.ts` — per-app resource limits (#5): the SINGLE source of
+  generous defaults, clamps, and merge/parse. Read by the runner, `ScopedFetcher`,
+  `AppData` and `AppSql`. Overrides live in AppHost's `__limits__` scope;
+  `AppHost.setLimits` pushes the store caps to `AppData.setStorageLimits` and the
+  SQL caps to `AppSql.setSqlLimits`.
 - `src/agent/runner.ts` — runs untrusted app code in a Dynamic Worker (injects
-  the `SYSTEM` broker, `globalOutbound: null`, attaches the tail worker; uses a
-  persisted build on a cold cache via `resolvePrebuilt`). Exposes fetch/reduce/
+  the `SYSTEM` broker, `globalOutbound: null`, per-run `limits` {cpuMs,subRequests},
+  attaches the tail worker; uses a persisted build on a cold cache via
+  `resolvePrebuilt`). Exposes fetch/reduce/
   initialState/project/seats/probe/migrate/onUpgrade over one injected adapter
   bundle (`onUpgrade` = the app's own store/fs/blob data migration, #10 — it runs
   with `env.SYSTEM`, unlike the pure `migrate`).
 - `src/agent/schema.ts` — AppHost's SQLite tables + query helpers (`files`,
   `versions`, `builds`; `app_data` holds the framework `__room__` + `__egress__` +
-  `__upgrade__` scopes).
+  `__upgrade__` + `__limits__` + `__secrets__` + `__email__` scopes).
 - `src/observability/dynamic-worker-tail.ts` — `DynamicWorkerTail`: captures each
   untrusted app run's logs/exceptions/outcome into Workers Logs, tagged by
   `workerId` (attached in `runner.ts`).
-- `src/capabilities/{broker,scoped-store,scoped-filesystem,scoped-blob-store,scoped-fetcher}.ts`
-  — capability sandbox. broker mints store/fs/blob/fetch; store adds atomic
-  `incr`/`cas` + JSON helpers; blob is R2-backed; fetcher is mediated egress
-  (`send`, allowlist-gated).
+- `src/capabilities/{broker,scoped-store,scoped-sql,scoped-filesystem,scoped-blob-store,scoped-fetcher,scoped-secrets,scoped-email,scoped-room,scoped-scheduler}.ts`
+  — capability sandbox. broker mints store/sql/fs/blob/fetch/secrets/email/room/scheduler; store adds
+  atomic `incr`/`cas` + JSON helpers; blob is R2-backed; fetcher is mediated egress
+  (`send`, allowlist-gated, SSRF-safe per-hop redirect check + size/timeout caps);
+  email is mediated transactional send (`send`, sender/recipient policy + daily cap
+  checked+reserved on AppHost, then the host-side `EMAIL` binding — app can't spoof
+  `From` or exceed `emailPerDay`); room is app-driven realtime (`broadcast`/`send`/
+  `presence`) that reaches AppHost's live WS connections by RPC (the app holds no
+  socket) and delivers `{type:"app",data}` frames;   scheduler (`after`/`at`/`every`/
+  `cancel`/`list`) enqueues tasks in the AppScheduler DO that later run the app's
+  `onSchedule` export (capped by `maxScheduledTasks`); sql (`exec`/`query`/`first`/
+  `run`) is a private relational database in the per-room AppSql DO (row + DB-size
+  caps enforced there).
+- `src/capabilities/manifest.ts` — the capability CATALOG and SINGLE source of
+  truth (`CapabilityId`, `CAPABILITIES`, `renderCapabilityContract`,
+  `KNOWN_CAPABILITY_IDS`, `validateDeclares`). The `declares` vocab, the assistant
+  system-prompt contract block, and human docs all derive from it. **When you add
+  a capability, add its entry here** — do NOT re-describe it inline in the system
+  prompt (the prompt renders from this). Mark reserved ones `available: false`.
 - `src/assistant/code-assistant.ts` — the AI coding assistant, a SEPARATE Durable
   Object `CodeAssistant extends Think` (`@cloudflare/think`). One per room, keyed
   by the room id. Runs the agentic loop (model calls host-side tools → reads
@@ -69,18 +125,25 @@ preview-grade APIs + bundle/model ceilings. Full table: README "Hardening status
 - `src/realtime/coordinator.ts` — the realtime engine (WS/presence/seats/
   per-player broadcast) that drives the app's pure `applyAction` reducer and
   optional `view` projection. State transitions are serialized (a promise chain)
-  so concurrent frames don't race. Pure-reducer path is live; `broker.requestRoom`
-  (app-driven realtime) is still a reserved future consumer. On a successful
+  so concurrent frames don't race. Pure-reducer path is live. It also exposes a
+  public `presence()` for the app-driven Room capability (`broker.requestRoom` →
+  `ScopedRoom`), which is now a SECOND consumer of this engine: the app pushes to
+  connected clients via AppHost's `appBroadcast`/`appSendToSeat`/`appPresence`
+  (reached by RPC), delivered as `{type:"app",data}` frames. On a successful
   promote, `AppHost` also broadcasts a debounced `{type:"reload"}` frame so every
   connected client reloads onto the new code (not just the editor's tab).
 - `public/index.html` — the lobby (create/join a room), served at `/`.
 - `public/room.html` — the room page (vanilla JS), served at `/room.html?room=<id>`.
   Shows the live app (the game) by default; an **Edit** button reveals the
-  editor tools (Run/preview, **Chat**, Code, History). The **Chat** panel is a
-  vanilla-JS client for `CodeAssistant`, speaking the Agents chat WebSocket
-  protocol (`cf_agent_chat_*`) on `/agents/code-assistant/<room>`. In edit mode it
-  also opens a read-only `?spectate=1` WS to `/agents/app-host/<room>` to keep the
-  header status/version live via `cf_agent_state` (see "Live status feed" below).
+  editor tools (Run/preview, **Chat**, Code, **Resources**, History). The **Chat**
+  panel is a vanilla-JS client for `CodeAssistant`, speaking the Agents chat
+  WebSocket protocol (`cf_agent_chat_*`) on `/agents/code-assistant/<room>`. The
+  **Resources** panel (the `Resources` module) reads ONE `GET /api/resources`
+  snapshot (capability catalog + per-app config) and writes back through the
+  existing `POST /api/{limits,egress,secrets,email}` routes, reloading after each
+  change — it never talks to the app sandbox, only trusted host config. In edit
+  mode it also opens a read-only `?spectate=1` WS to `/agents/app-host/<room>` to
+  keep the header status/version live via `cf_agent_state` (see "Live status feed").
 
 ## Multi-room
 
@@ -189,12 +252,50 @@ per room (app + assistant), same id.
 Default export `fetch(request, env)`; HTML page at `/`; persist via
 `env.SYSTEM.requestStore(...)`; relative URLs in HTML. **Capabilities today:**
 `requestStore` (KV — incl. ATOMIC `incr`/`cas` and JSON `putJSON`/`getJSON`),
+`requestSql` (a private RELATIONAL SQLite database — `exec`/`query`/`first`/`run`
+with `?`-bound params, for tabular/related/aggregated data; row + DB-size capped),
 `requestFilesystem` (dofs, ≤256 KiB files), `requestBlobStore` (R2, large
-binaries), and `requestFetch` (MEDIATED egress — the app sandbox stays
+binaries), `requestFetch` (MEDIATED egress — the app sandbox stays
 `globalOutbound: null`; `ScopedFetcher.send()` only reaches hosts on the app's
 per-app allowlist, held in trusted AppHost storage and set via `POST /api/egress`
-or a template's `egress: []`, NEVER by the app). Multiplayer
-apps additionally export a pure `applyAction(state, action, ctx)` (+ optional
+or a template's `egress: []`, NEVER by the app; per-hop redirect re-check +
+timeout/size caps), and `requestSecrets` (USE-NOT-READ credentials: values live
+in AppHost's trusted `__secrets__` scope set via `POST /api/secrets`; the app
+INJECTS them host-side via `ScopedFetcher.send`'s `secretHeaders` without ever
+reading them, and `requestSecrets().get` returns a raw value ONLY for a secret
+flagged `readable`, else throws — `has`/`list` are names-only), and
+`requestEmail` (MEDIATED transactional email: `ScopedEmail.send({to,subject,html,
+text,cc?,bcc?,replyTo?,from?})` validates the sender/recipients against the room's
+policy — trusted `__email__` scope, set via `POST /api/email`, NEVER by the app —
+and reserves a slot in the per-day cap `emailPerDay` (`__limits__`) on AppHost
+before the host-side `EMAIL` binding sends; the app can't spoof an arbitrary `From`
+(omit it for the default sender) or exceed the cap. Reserve-before-send: a failed
+send still consumes a slot. Local `wrangler dev` accepts sends as a no-op sink
+unless a domain is onboarded + `send_email` binding is `"remote": true`).
+And `requestRoom` (APP-DRIVEN realtime — the escape hatch alongside the pure
+reducer): `ScopedRoom` gives `broadcast(msg)` / `send(seat, msg)` / `presence()`,
+reaching THIS room's live WS connections by RPC into AppHost (the app holds no
+socket) and delivering `{type:"app",data}` frames (distinct from the coordinator's
+`welcome`/`state`/`reload`). Use it when the update originates OUTSIDE a WS action
+(HTTP handler, webhook, scheduled task); keep app-driven state in `requestStore`,
+NOT the coordinator's `__room__`.
+And `requestScheduler` (deferred/recurring work): `after(seconds,task,payload?)` /
+`at(unixMs,...)` / `every(seconds,...)` / `cancel(id)` / `list()`. Tasks live in
+the per-room `AppScheduler` DO (own SQLite + alarm); when due it runs the app's
+`onSchedule(env, ctx)` export (ctx `{task,payload}`) in the sandbox with full
+`env.SYSTEM` — so a task can persist, fetch, email, or broadcast via `requestRoom`.
+Pending tasks are capped by `maxScheduledTasks`; delays/intervals floor at 1s.
+Any app (realtime or not) may export `onSchedule` to receive these.
+And `requestSql` (a private RELATIONAL database): `exec(sql, ...params)` →
+`{rows,columnNames,rowsRead,rowsWritten,lastRowId}`, plus conveniences
+`query`→rows[], `first`→row|null, `run`→`{rowsWritten,rowsRead,lastRowId}`. Backed
+by the per-room `AppSql` DO (its OWN SQLite) — a real SQL surface (define tables,
+run arbitrary queries) distinct from `requestStore`'s flat KV. ALWAYS use `?`
+placeholders + params (booleans coerce to 0/1). Guardrails enforced in AppSql:
+`sqlMaxRows` per query (throws → add LIMIT) + `sqlMaxDbBytes` (blocks growth
+writes at the cap, allows SELECT/DELETE/DROP to recover). Reach for SQL over the
+flat store whenever data is tabular/related/filtered/sorted/aggregated.
+Multiplayer apps additionally export a pure `applyAction(state, action, ctx)` (+ optional
 `initialState`, `seats`, and `view(state, ctx)` for hidden information) and
 connect a WebSocket to `/agents/app-host/<room>?token=<id>` (the room read from
 the page's own `location`, default `main`). The realtime client MUST also handle
@@ -245,18 +346,33 @@ Reasoning models get `beforeTurn` guards: a large `maxOutputTokens` (so reasonin
 can't crowd out the tool call) and `reasoning_effort` (default `medium`, tunable
 via `ASSISTANT_REASONING_EFFORT`). There is no `/api/edit` HTTP route anymore.
 
-## One app at a time
+## App selection (per-room, runtime)
 
-This framework hosts ONE app. The hosted app is chosen by the SINGLE constant
-`DEFAULT_TEMPLATE_ID` in `src/templates/registry.ts` (currently `blackjack`);
-`AppHost.initialState.templateId` derives from it. Every room seeds from it. To
-build a different app, change that one line (e.g. `"poker"` or `"counter"`)
-and/or the template's files. Note: a room already in `.wrangler/` keeps its
-seeded code — use a fresh room id (or clear `.wrangler/`) after switching. The
-five example apps (`blackjack`, `poker`, `tictactoe`, `counter`, `notes`) all
-conform to the current contract; `npm run smoke` (see below) covers `counter`,
-`tictactoe` and `poker` (`blackjack` and `notes` have no smoke check — test them
-by hand).
+Each room picks its app AT CREATE TIME from the template catalog (runtime template
+selection). The lobby (`public/index.html`) reads `GET /api/templates` (a static
+catalog from `registry.listTemplates()` — id/label/declares, NO file bodies) into
+a picker, then `POST /api/create?room=<id>` with `{template}` seeds that room from
+the chosen template BEFORE navigating to it. `DEFAULT_TEMPLATE_ID` in
+`src/templates/registry.ts` (currently `blackjack`) is now only the FALLBACK — used
+when a room is reached without a create call (back-compat) or when an unknown
+template id is requested.
+
+**Seeding is LAZY, not in `onStart`.** `onStart` is awaited before any RPC, so
+seeding there would always pick the default before a caller could choose. Instead
+`AppHost.#ensureSeeded(templateId?)` seeds once (guarded by `hasAnyVersion`) and is
+called at the top of every entry point (`getStatus`/`getResources`/`getFiles`/
+`listVersions`/`getRunManifest`/`preview`/`resetToTemplate`/`onConnect`). The
+public `create(templateId?)` is what the lobby calls — it seeds the CHOSEN template
+and is idempotent (an existing room is returned unchanged, `created:false`, NEVER
+re-seeded). Any other first-touch seeds the default. A room already in `.wrangler/`
+keeps its seeded code — use a fresh room id (or clear `.wrangler/`).
+
+The five example apps (`blackjack`, `poker`, `tictactoe`, `counter`, `notes`) all
+conform to the current contract; `npm run smoke` (see below) auto-detects a room's
+app via `/api/state` and covers `counter`, `tictactoe` and `poker` (`blackjack` and
+`notes` have no smoke check — test them by hand). To smoke a specific app, create a
+room with it (`POST /api/create?room=<id>` `{template}`) and point the smoke script
+at that room.
 
 ## Run / verify
 
@@ -273,11 +389,14 @@ curl -s localhost:8787/preview/            # renders the app page (blackjack tab
 npm run smoke                              # runtime checks for the LIVE app
 ```
 `npm run smoke` (`scripts/smoke.mjs`, no deps — Node 22+ `fetch`/`WebSocket`)
-auto-detects the hosted app via `/api/state` and runs the matching checks against
-a FRESH room: `counter` (HTTP inc/dec/reset persist), `tictactoe` (seats X/O +
-spectator, win/turn/rematch, identical broadcast), `poker` (distinct seats +
-per-player `view` hides other hands). To verify ALL three, set
-`DEFAULT_TEMPLATE_ID` to each, restart `npm run dev`, and re-run `npm run smoke`.
+CREATES a fresh room seeded with the app you pass (`POST /api/create`), then runs
+the matching checks: `npm run smoke -- counter` (HTTP inc/dec/reset persist),
+`-- tictactoe` (seats X/O + spectator, win/turn/rematch, identical broadcast),
+`-- poker` (distinct seats + per-player `view` hides other hands). Thanks to
+runtime template selection you can smoke ALL three against ONE running dev server —
+no restart needed (a base URL and the app name can be passed in any order:
+`npm run smoke -- poker http://localhost:8788`). With no app name a fresh room
+seeds the default (blackjack), which has no suite.
 Multiplayer is over WebSockets, so test it in multiple browser tabs: open the
 lobby at http://localhost:8787, **Create room**, then open that room's URL
 (`/room.html?room=<id>`, or the "Copy link" button) in more tabs — state syncs
@@ -440,12 +559,90 @@ After editing `wrangler.jsonc`, run `npm run types` to regenerate
   HTMLRewriter (also streaming). This keeps the HTTP data path off the DO and
   enables SSE/large bodies. `AppHost.preview()` (buffered) still exists for the
   assistant's `preview` tool ONLY.
+- **Secrets (`capabilities/scoped-secrets.ts`, #2.1).** USE-NOT-READ credentials.
+  Values live in AppHost's trusted `__secrets__` scope (`{ v, r }` per name), set
+  ONLY via `POST /api/secrets` (`setSecret`/`deleteSecret`) — never by the app,
+  never returned over the wire (`/api/secrets` GET + `listSecrets` are names +
+  `readable` flag only). `AppHost.resolveSecret(name, { requireReadable? })` is the
+  TRUSTED resolver: capability stubs call it (reachable only host-side, not by the
+  app). `ScopedFetcher` injects `secretHeaders` WITHOUT `requireReadable` (value
+  never enters the sandbox; stripped on redirect so creds don't follow to another
+  host); `ScopedSecrets.get` calls it WITH `requireReadable` (raw read only for a
+  secret flagged `readable`). No new binding — pure DO storage.
+- **Email (`capabilities/scoped-email.ts`, #2.2).** MEDIATED transactional email.
+  Policy lives in AppHost's trusted `__email__` scope (`allowedFrom`,
+  `allowRecipients`, `defaultFrom`, `fromName`), set ONLY via `POST /api/email`
+  (`setEmailPolicy`) — never by the app. `AppHost.reserveEmail({from?,recipients})`
+  is the TRUSTED gate: it resolves+validates the sender (must be in `allowedFrom`;
+  omitted ⇒ `defaultFrom`/first), checks each recipient against `allowRecipients`
+  (empty ⇒ allow any; entries are exact `a@b.com`, domain `b.com`, or `*.b.com`),
+  and RESERVES one slot in the daily counter (`sent:YYYY-MM-DD` in `__email__`,
+  capped by `emailPerDay` from `__limits__`) — all SYNC DO storage, so it's
+  serialized on the input gate and can't overspend under concurrency. The slow
+  `env.EMAIL.send()` runs in the STUB (host worker), NOT the DO, so it never holds
+  the gate (limitation #3). Reserve-before-send ⇒ a failed network send still
+  consumes a slot (intentional: bounds retry storms). The app never sees the
+  `EMAIL` binding; `ScopedEmail.send()` is the only surface. `send_email` binding
+  in `wrangler.jsonc` uses `name` (not `binding`); local dev accepts sends as a
+  no-op sink (real sending needs an onboarded domain + `"remote": true`).
+- **App-driven realtime (`capabilities/scoped-room.ts`, #2.3).** The SECOND
+  consumer of the realtime engine, alongside the pure reducer. The app is a pure
+  per-request function and holds NO socket; `ScopedRoom` reaches the room's live
+  WS connections by RPC into AppHost (`appBroadcast`/`appSendToSeat`/`appPresence`)
+  — the sockets live in AppHost, the DO. Delivers each message as
+  `{type:"app",data}` (never collides with the coordinator's `welcome`/`state`/
+  `reload`); editor spectators (`SPECTATOR_TOKEN`) are always excluded. Presence
+  comes from `RoomCoordinator.presence()` (seat pool + who's connected). By design
+  it does NOT expose the coordinator's `__room__` state — app-driven apps keep
+  their own state in `requestStore`, so the two state models never race. No new
+  binding — pure DO RPC. The app's client connects a WS to
+  `/agents/app-host/<room>?token=<id>` and handles the `{type:"app"}` frame.
+- **Scheduler (`capabilities/scoped-scheduler.ts` + `agent/app-scheduler.ts`, #2.4).**
+  Deferred/recurring work. `ScopedScheduler` (after/at/every/cancel/list) reaches
+  the per-room `AppScheduler` DO DIRECTLY (`env.APP_SCHEDULER.idFromName(instance)`,
+  like AppData — limitation #3). AppScheduler holds tasks in its OWN SQLite and a
+  single DO ALARM armed to the earliest task; `alarm()` mutates the table FIRST
+  (advance recurring / delete one-shots) THEN runs each due task, so a slow/failing
+  task is never re-fired in the same pass. It loads the app's live code from AppHost
+  by RPC (`getRunManifest`/`getBuild`) and runs `onSchedule(env, ctx)` via
+  `runner.runSchedule` — SAME sandbox as fetch (only `env.SYSTEM`), so a task can
+  broadcast via `requestRoom`, persist, fetch, email. AppScheduler persists the
+  `instance` (room id) in a `sched_meta` row on first schedule, since the alarm has
+  no caller to supply it. Guardrails: `maxScheduledTasks` (trusted limit, enforced
+  atomically in the DO) + a hardcoded 1s delay/interval floor (`MIN_DELAY_MS`) to
+  stop alarm storms. NOTE: `sql.exec<T>` needs a `type` alias (an `interface` fails
+  the `Record<string, SqlStorageValue>` constraint). No new store scope — it's a
+  separate DO. New binding `APP_SCHEDULER` + migration `tag: "v4"` in wrangler.
+- **SQL (`capabilities/scoped-sql.ts` + `agent/app-sql.ts`, #2.5).** A private
+  RELATIONAL database, distinct from `requestStore`'s flat KV. `ScopedSql`
+  (`exec`/`query`/`first`/`run`) reaches the per-room `AppSql` DO DIRECTLY
+  (`env.APP_SQL.idFromName(instance)`, like AppData/AppScheduler — limitation #3),
+  which owns its SQLite. Guardrails live IN AppSql (no per-query RPC to AppHost):
+  the caps are PUSHED once from `AppHost.setLimits` via `setSqlLimits` (persisted
+  in a `__appsql_meta__` row, defaulting to `DEFAULT_LIMITS`), then enforced
+  locally — `sqlMaxRows` throws if a result exceeds the cap ("add LIMIT"), and
+  `sqlMaxDbBytes` blocks GROWTH writes (INSERT/UPDATE/CREATE/ALTER/REPLACE, by a
+  leading-keyword heuristic) once `ctx.storage.sql.databaseSize >= cap`, while
+  SELECT/DELETE/DROP/PRAGMA stay allowed so the app can recover. `ScopedSql`
+  coerces boolean params → 0/1; `lastRowId` is computed (via `last_insert_rowid()`)
+  ONLY when `rowsWritten > 0`. Trusted tenants: an app may run arbitrary SQL/DDL
+  against its OWN db — we do NOT block `sqlite_*`/`_cf_*` tables (the platform
+  already blocks internal writes; isolation is by DO, not by SQL parsing).
+  `sql.exec<T>` needs a `type` alias for the row type (an `interface` fails the
+  `Record<string, SqlStorageValue>` constraint). New binding `APP_SQL` + migration
+  `tag: "v5"` in wrangler. `AppHost.setLimits` now pushes to BOTH AppData
+  (store caps) and AppSql (sql caps).
 - **New capability files:** `capabilities/scoped-blob-store.ts` (R2, keyed by
   `<instance>/<namespace>/`), `capabilities/scoped-fetcher.ts` (mediated egress,
-  method is `send` not `fetch` to avoid the WorkerEntrypoint collision). Both are
+  method is `send` not `fetch` to avoid the WorkerEntrypoint collision),
+  `capabilities/scoped-secrets.ts` (secrets, above), `capabilities/scoped-email.ts`
+  (email, above), `capabilities/scoped-room.ts` (app-driven realtime, above),
+  `capabilities/scoped-scheduler.ts` (scheduler, above),
+  `capabilities/scoped-sql.ts` (SQL, above). All are
   exported from `server.ts` and minted by the broker. R2 binding `BLOBS` is in
   `wrangler.jsonc` (`r2_buckets`); after adding it, `npm run types` regenerates a
   STRICTER d.ts (pins `ASSISTANT_MODEL` to a literal + retypes stubs) that breaks
   `tsc` — the committed `worker-configuration.d.ts` is hand-kept with
-  `ASSISTANT_MODEL: string`; add new bindings by hand rather than clobbering it.
+  `ASSISTANT_MODEL: string`; add new bindings by hand rather than clobbering it
+  (the `send_email` `SendEmail` binding was added by hand under `__BaseEnv_Env`).
 - Local DO state persists in `.wrangler/` across dev restarts.
