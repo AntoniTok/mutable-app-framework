@@ -255,10 +255,67 @@ name, so `ScopedStore`/`ScopedFilesystem` call it directly (**two hops**) and
 `AppHost` leaves the storage path entirely. The class body is essentially
 unchanged — it moved from `src/agent/facet/entry.ts` (bundled to a string for the
 Worker Loader) to `src/agent/app-data.ts` (a normally-bundled DO), so we also
-dropped the `build:facet` esbuild step and the loader indirection. The lesson:
-**facets are the right tool when the second store is genuinely subordinate to one
-parent and only that parent needs it; when many callers need it directly, a
-top-level DO avoids the parent becoming a funnel.**
+dropped the `build:facet` esbuild step and the loader indirection.
+
+#### Why NOT a facet — the explicit decision rule
+
+A facet and a top-level DO give the **same isolation** (own SQLite, own input
+gate, platform-enforced mutual isolation). They differ on **one axis only:
+addressability**. That single difference is the whole decision:
+
+- A **facet has no name.** It is reachable *only* through its parent
+  (`parent.ctx.facets.get(...)`). Any external caller must therefore go
+  **through the parent**.
+- A **top-level DO has a name.** Any binding holder can reach it directly with
+  `NS.get(idFromName(...))` / `NS.getByName(...)`.
+
+So the rule we now apply to every "second isolated store" is:
+
+> **Who calls it?**
+> • Only the parent, and the store is conceptually part of the parent → **facet**
+>   (parent-private sub-store; the parent hop is free because the parent was
+>   going to be on the path anyway).
+> • Anyone *other* than the parent — especially something on a hot path that must
+>   NOT wake/serialize the parent → **top-level DO** (a facet would force that
+>   caller through the parent, turning it into a funnel = limitation #3).
+
+Applying the rule to this project, **none** of the app-runtime DOs qualify as a
+facet, and all three are top-level for the same reason:
+
+| DO | Who reaches it | If it were a facet of AppHost | Verdict |
+|----|----------------|-------------------------------|---------|
+| `AppData` | `ScopedStore`/`ScopedFilesystem`, from the app request path | every `store.get`/`fs.read` serializes on AppHost's input gate, contending with code + realtime | **top-level DO** |
+| `AppSql` | `ScopedSql`, from the app request path | every query funnels through AppHost | **top-level DO** |
+| `AppScheduler` | `ScopedScheduler` + its own DO alarm | tasks + alarm callbacks funnel through AppHost | **top-level DO** |
+
+The invariant that makes this decisive: **AppHost is the single per-room code +
+realtime coordinator DO, and it must stay off the storage hot path** (limitation
+#3). Anything an app touches per-request (store, SQL, scheduler) is reached by a
+capability stub that must NOT route through AppHost — which rules out a facet by
+construction. `CodeAssistant` is separate for an orthogonal reason (it `extends
+Think`, single-inheritance vs AppHost's `extends Agent`, and is routed to directly
+by name over its own WS route — a facet couldn't be routed to independently).
+
+The general lesson: **facets are the right tool ONLY when the second store is
+genuinely subordinate to one parent and only that parent needs it; the moment a
+different caller needs it directly, use a named top-level DO so the parent never
+becomes a funnel.**
+
+#### Current platform status (checked 2026 — facets are no longer the public pattern)
+
+Since we made this migration, Cloudflare has effectively converged on our
+conclusion. As of the current docs:
+
+- **`ctx.facets` is gone from the public [DurableObjectState API](https://developers.cloudflare.com/durable-objects/api/state/)**, and "facet" appears **zero** times in the Durable Objects docs index (`llms.txt`). Facets still exist in the runtime (the Agents SDK uses them internally — `cf_agents_is_facet`), but they are no longer a recommended, documented public API.
+- The replacement is **`ctx.exports`** (behind the `enable_ctx_exports` compat flag): *"for each top-level export that extends DurableObject … `ctx.exports` automatically contains a Durable Object namespace binding."* In other words the platform's answer to "give a DO a second isolated SQLite" is now exactly what we did — **a named top-level DO** — with the added convenience that it can be reached via an auto-generated loopback namespace binding, no explicit `wrangler` binding required. This is essentially "facets, but addressable by name," the very thing recommendation #4 below asked for.
+
+**Possible future simplification (not yet adopted):** enable `enable_ctx_exports`
+and reach `AppData`/`AppSql`/`AppScheduler` via `ctx.exports` loopback bindings
+instead of the explicit `APP_DATA`/`APP_SQL`/`APP_SCHEDULER` bindings — fewer
+declared bindings, same 2-hop direct addressing. We already use the sibling
+mechanism (`import { exports } from "cloudflare:workers"` in `runner.ts` /
+`broker.ts`) to mint the `WorkerEntrypoint` capability stubs, so extending it to
+the DO side is a small, natural step.
 
 ### `@cloudflare/dofs` (Workspace) — partial: vendored, fs-layer only
 
@@ -346,11 +403,17 @@ is precisely why we bypass Think's helper and control the tool list ourselves.
 3. **Support a "bring-your-own-filesystem" hook in Think.** Its biggest friction:
    it assumes the agent owns its filesystem. Users whose source of truth is
    external/gated (another DO, VCS, a build step) must disable the built-in tools.
-4. **Make facets addressable by name (or document the funnel).** Facets are the
-   natural way to give a DO a second isolated SQLite, but because a facet is only
-   reachable *through its parent*, using one for data that many callers need turns
-   the parent into a hot-path funnel (our limitation #3 — we moved off a facet to
-   a top-level `AppData` DO for exactly this). A way to address a facet directly,
-   or clearer guidance that facets suit *parent-private* sub-stores only, would
-   have saved us the migration. As a rule: isolated sub-store used by one parent →
-   facet; isolated store many callers hit directly → top-level DO.
+4. **Make facets addressable by name (or document the funnel).** ✅ *Largely
+   addressed by the platform since.* Facets were the natural way to give a DO a
+   second isolated SQLite, but because a facet is only reachable *through its
+   parent*, using one for data that many callers need turns the parent into a
+   hot-path funnel (our limitation #3 — we moved off a facet to a top-level
+   `AppData` DO for exactly this). A way to address a facet directly, or clearer
+   guidance that facets suit *parent-private* sub-stores only, would have saved us
+   the migration. As a rule: isolated sub-store used by one parent → facet;
+   isolated store many callers hit directly → top-level DO. **Update:** current
+   docs have dropped `ctx.facets` from the public API and introduced `ctx.exports`
+   loopback namespace bindings for top-level DO classes — i.e. named, directly
+   addressable second stores without boilerplate bindings. That is the "addressable
+   by name" fix we wanted; the top-level-DO-with-direct-addressing pattern is now
+   the documented default. See §"App runtime data" → "Current platform status".
